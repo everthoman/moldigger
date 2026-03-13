@@ -1,0 +1,28 @@
+# Data files
+*.h5
+*.h5.*
+*.json
+*.csv
+*.sdf
+*.sdf.gz
+*.smi
+*.txt
+*.cif
+*.html
+*.gz
+*Zone.Identifier
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Other scripts (not part of moldigger)
+conformers.py
+merge_pharmit_sdf.py
+molsim_diag.py
+piperazine_chair.py
+sar_summary.py
+segfault_diag.py
+segfault_diag2.py
+venetoclax.py
+verify_tanimoto.py
