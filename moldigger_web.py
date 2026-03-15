@@ -1338,9 +1338,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <thead>
           <tr>
             <th class="row-num">#</th>
-            <th>Structure</th>
             <th class="sortable" onclick="sortTable('name')">Name <span class="sort-icon"></span></th>
-            <th class="sortable" onclick="sortTable('score')">Score <span class="sort-icon"></span></th>
+            <th>Structure</th>
+            <th class="sortable" id="score-header" onclick="sortTable('score')">Score <span class="sort-icon"></span></th>
             <th class="sortable" onclick="sortTable('mw')">MW <span class="sort-icon"></span></th>
             <th class="sortable" onclick="sortTable('clogp')">ClogP <span class="sort-icon"></span></th>
             <th>SMILES</th>
@@ -1760,6 +1760,10 @@ function _doPoll(jid, context) {
 function renderResults(data) {
   currentResults = data.rows || [];
   const total = data.total || 0;
+  const metricLabel = currentSearchType === 'substructure' ? 'Substructure'
+    : (document.getElementById('metric-select').options[document.getElementById('metric-select').selectedIndex].text);
+  const scoreHeader = document.getElementById('score-header');
+  if (scoreHeader) scoreHeader.childNodes[0].textContent = metricLabel + ' ';
 
   document.getElementById('placeholder').style.display = 'none';
   document.getElementById('results-header').style.display = 'flex';
@@ -1802,13 +1806,13 @@ function _renderTable() {
     if (isSub) {
       scoreHtml = '<span class="score-cell score-sub">match</span>';
     } else {
-      scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(4) + '</span>';
+      scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(2) + '</span>';
     }
 
     tr.innerHTML =
       '<td class="row-num">' + (i + 1) + '</td>' +
-      '<td class="struct-cell">' + (row.svg || '') + '</td>' +
       '<td class="name-cell" title="' + escHtml(row.name || '') + '">' + escHtml(truncate(row.name || '', 24)) + '</td>' +
+      '<td class="struct-cell">' + (row.svg || '') + '</td>' +
       '<td>' + scoreHtml + '</td>' +
       '<td class="prop-cell">' + (row.mw !== null && row.mw !== undefined ? row.mw.toFixed(1) : '—') + '</td>' +
       '<td class="prop-cell">' + (row.clogp !== null && row.clogp !== undefined ? row.clogp.toFixed(2) : '—') + '</td>' +
@@ -1878,7 +1882,7 @@ function exportCsv() {
     return [
       i + 1,
       csvEsc(r.name || ''),
-      r.score.toFixed(4),
+      r.score.toFixed(2),
       r.mw !== null && r.mw !== undefined ? r.mw.toFixed(1) : '',
       r.clogp !== null && r.clogp !== undefined ? r.clogp.toFixed(2) : '',
       csvEsc(r.smiles || ''),

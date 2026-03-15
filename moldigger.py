@@ -1279,6 +1279,7 @@ class SearchParamsWidget(QGroupBox):
         self._thresh_max_label = QLabel("Threshold ≤")
         self._thresh_max_widget = QWidget()
         self._thresh_max_widget.setLayout(thresh_max_row)
+        self._thresh_max_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         form.addRow(self._thresh_max_label, self._thresh_max_widget)
 
         # Max results to display
@@ -1381,8 +1382,8 @@ class ResultsTable(QTableWidget):
 
     use_as_query = pyqtSignal(str)   # emitted with SMILES when "Use as Query" is chosen
 
-    _COLS = ["#", "Name", "Tanimoto", "SMILES", "Structure", "MW", "ClogP"]
-    _COL_SMILES = 3
+    _COLS = ["#", "Name", "Structure", "Score", "MW", "ClogP", "SMILES"]
+    _COL_SMILES = 6
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1396,13 +1397,13 @@ class ResultsTable(QTableWidget):
         hh = self.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)   # rank
         hh.setSectionResizeMode(1, QHeaderView.Interactive)        # name
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)   # tanimoto
-        hh.setSectionResizeMode(3, QHeaderView.Stretch)            # SMILES
-        hh.setSectionResizeMode(4, QHeaderView.Fixed)              # structure
-        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)   # MW
-        hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)   # ClogP
+        hh.setSectionResizeMode(2, QHeaderView.Fixed)              # structure
+        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)   # score
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)   # MW
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)   # ClogP
+        hh.setSectionResizeMode(6, QHeaderView.Stretch)            # SMILES
         self.setColumnWidth(1, 160)
-        self.setColumnWidth(4, RESULT_IMG_SIZE + 6)
+        self.setColumnWidth(2, RESULT_IMG_SIZE + 6)
         self.verticalHeader().setDefaultSectionSize(RESULT_IMG_SIZE + 6)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1432,7 +1433,7 @@ class ResultsTable(QTableWidget):
         elif action == act_query:
             self.use_as_query.emit(smiles)
 
-    def populate(self, results, mol_map: dict, query_mol=None, highlight_map=None):
+    def populate(self, results, mol_map: dict, query_mol=None, highlight_map=None, metric: str = "Score"):
         """
         results       : numpy structured array with (mol_id, coeff) OR list of (mol_id, score)
         mol_map       : {int(mol_id): {"smiles": str, "name": str}}
@@ -1440,7 +1441,9 @@ class ResultsTable(QTableWidget):
         highlight_map : optional {int(mol_id): [atom_indices]} — direct substructure highlights
                         (takes priority over MCS when provided)
                   OR legacy {int(mol_id): smiles_str}
+        metric        : label shown in the Score column header
         """
+        self.setHorizontalHeaderItem(3, QTableWidgetItem(metric))
         self.setSortingEnabled(False)
         self.clearContents()
         self.setRowCount(0)
@@ -1475,49 +1478,48 @@ class ResultsTable(QTableWidget):
             # --- Name / identifier ---
             self.setItem(row, 1, QTableWidgetItem(name))
 
-            # --- Tanimoto / match score ---
+            # --- Structure thumbnail (col 2) ---
+            if smiles and RDKIT_OK:
+                mol = Chem.MolFromSmiles(smiles)
+                if mol:
+                    thumb = MolViewer(RESULT_IMG_SIZE, RESULT_IMG_SIZE)
+                    h_atoms = highlight_map.get(mol_id) if highlight_map else None
+                    if h_atoms is not None:
+                        thumb.render_mol(mol, highlight_atoms=h_atoms)
+                    else:
+                        thumb.render_mol(mol, query_mol=query_mol)
+                    self.setCellWidget(row, 2, thumb)
+
+                    mw_item = QTableWidgetItem()
+                    mw_item.setData(Qt.DisplayRole, round(Descriptors.MolWt(mol), 2))
+                    mw_item.setTextAlignment(Qt.AlignCenter)
+                    self.setItem(row, 4, mw_item)
+
+                    clogp_item = QTableWidgetItem()
+                    clogp_item.setData(Qt.DisplayRole, round(Descriptors.MolLogP(mol), 2))
+                    clogp_item.setTextAlignment(Qt.AlignCenter)
+                    self.setItem(row, 5, clogp_item)
+
+            # --- Score (col 3) ---
             score_item = QTableWidgetItem()
             if highlight_map is not None:
                 score_item.setData(Qt.DisplayRole, "match")
                 score_item.setBackground(QColor.fromHsvF(1/3, 0.65, 1.0))  # green
             else:
                 score_item.setData(Qt.DisplayRole, f"{score:.2f}")
-                hue = score / 3.0
-                score_item.setBackground(QColor.fromHsvF(hue, 0.65, 1.0))
+                score_item.setBackground(QColor.fromHsvF(score / 3.0, 0.65, 1.0))
             score_item.setTextAlignment(Qt.AlignCenter)
-            self.setItem(row, 2, score_item)
+            self.setItem(row, 3, score_item)
 
-            # --- SMILES ---
-            self.setItem(row, 3, QTableWidgetItem(smiles))
-
-            if smiles and RDKIT_OK:
-                mol = Chem.MolFromSmiles(smiles)
-                if mol:
-                    thumb = MolViewer(RESULT_IMG_SIZE, RESULT_IMG_SIZE)
-                    # Substructure mode: use exact match atoms; similarity mode: use MCS
-                    h_atoms = highlight_map.get(mol_id) if highlight_map else None
-                    if h_atoms is not None:
-                        thumb.render_mol(mol, highlight_atoms=h_atoms)
-                    else:
-                        thumb.render_mol(mol, query_mol=query_mol)
-                    self.setCellWidget(row, 4, thumb)
-
-                    mw_item = QTableWidgetItem()
-                    mw_item.setData(Qt.DisplayRole, round(Descriptors.MolWt(mol), 2))
-                    mw_item.setTextAlignment(Qt.AlignCenter)
-                    self.setItem(row, 5, mw_item)
-
-                    clogp_item = QTableWidgetItem()
-                    clogp_item.setData(Qt.DisplayRole, round(Descriptors.MolLogP(mol), 2))
-                    clogp_item.setTextAlignment(Qt.AlignCenter)
-                    self.setItem(row, 6, clogp_item)
+            # --- SMILES (col 6) ---
+            self.setItem(row, 6, QTableWidgetItem(smiles))
 
         self.setSortingEnabled(True)
-        self.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
 
     def export_csv(self, path: str):
         import csv
-        skip_cols = {4}   # skip the structure image column
+        skip_cols = {2}   # skip the structure image column
         with open(path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(
@@ -1998,7 +2000,8 @@ class SearchWidget(QWidget):
 
         to_show   = filtered[:max_r] if filtered is not None else []
         query_mol = Chem.MolFromSmiles(self.query_widget.get_smiles()) if RDKIT_OK else None
-        self.results_table.populate(to_show, self._smiles_map, query_mol=query_mol)
+        self.results_table.populate(to_show, self._smiles_map, query_mol=query_mol,
+                                    metric=params["metric"].capitalize())
 
         total = time.perf_counter() - self._t_search_start
         s_str = f"{elapsed * 1000:.1f} ms" if elapsed < 1 else f"{elapsed:.2f} s"
@@ -2015,7 +2018,7 @@ class SearchWidget(QWidget):
         to_show = results[:max_r]
         n_shown = len(to_show)
         self.results_table.populate(
-            to_show, self._smiles_map, highlight_map=match_atoms
+            to_show, self._smiles_map, highlight_map=match_atoms, metric="Substructure"
         )
 
         total  = time.perf_counter() - self._t_search_start
