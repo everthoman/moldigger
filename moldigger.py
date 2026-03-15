@@ -1250,6 +1250,37 @@ class SearchParamsWidget(QGroupBox):
         self._thresh_label = QLabel("Threshold ≥")
         form.addRow(self._thresh_label, thresh_row)
 
+        # Max threshold (upper bound)
+        thresh_max_row = QHBoxLayout()
+        self.thresh_max_slider = QSlider(Qt.Horizontal)
+        self.thresh_max_slider.setRange(1, 100)
+        self.thresh_max_slider.setValue(100)
+        self.thresh_max_spin = QDoubleSpinBox()
+        self.thresh_max_spin.setRange(0.01, 1.0)
+        self.thresh_max_spin.setSingleStep(0.01)
+        self.thresh_max_spin.setDecimals(2)
+        self.thresh_max_spin.setValue(1.00)
+        self.thresh_max_spin.setMaximumWidth(72)
+        self.thresh_max_slider.valueChanged.connect(
+            lambda v: self.thresh_max_spin.blockSignals(True)
+            or self.thresh_max_spin.setValue(v / 100)
+            or self.thresh_max_spin.blockSignals(False)
+            or self._clamp_thresh_min()
+        )
+        self.thresh_max_spin.valueChanged.connect(
+            lambda v: self.thresh_max_slider.blockSignals(True)
+            or self.thresh_max_slider.setValue(int(v * 100))
+            or self.thresh_max_slider.blockSignals(False)
+            or self._clamp_thresh_min()
+        )
+        self.thresh_spin.valueChanged.connect(lambda v: self._clamp_thresh_max())
+        thresh_max_row.addWidget(self.thresh_max_slider)
+        thresh_max_row.addWidget(self.thresh_max_spin)
+        self._thresh_max_label = QLabel("Threshold ≤")
+        self._thresh_max_widget = QWidget()
+        self._thresh_max_widget.setLayout(thresh_max_row)
+        form.addRow(self._thresh_max_label, self._thresh_max_widget)
+
         # Max results to display
         self.max_results = QSpinBox()
         self.max_results.setRange(1, 500_000)
@@ -1278,6 +1309,18 @@ class SearchParamsWidget(QGroupBox):
         self.search_type.currentTextChanged.connect(self._on_search_type_changed)
         self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
 
+    def _clamp_thresh_min(self):
+        """Ensure min threshold never exceeds max."""
+        mx = self.thresh_max_spin.value()
+        if self.thresh_spin.value() > mx:
+            self.thresh_spin.setValue(mx)
+
+    def _clamp_thresh_max(self):
+        """Ensure max threshold never goes below min."""
+        mn = self.thresh_spin.value()
+        if self.thresh_max_spin.value() < mn:
+            self.thresh_max_spin.setValue(mn)
+
     def set_fingerprint(self, name: str):
         """Select the fingerprint combo entry matching name (no-op if not found)."""
         idx = self.fp_combo.findText(name)
@@ -1290,17 +1333,23 @@ class SearchParamsWidget(QGroupBox):
         self.metric_combo.setEnabled(similarity)
         self.thresh_slider.setEnabled(similarity)
         self.thresh_spin.setEnabled(similarity)
+        self.thresh_max_slider.setEnabled(similarity)
+        self.thresh_max_spin.setEnabled(similarity)
         self.gpu_check.setEnabled(similarity and GPU_OK)
         if similarity:
             self._on_metric_changed(self.metric_combo.currentText())
         else:
             self._tversky_label.hide()
             self._tversky_widget.hide()
+            self._thresh_max_label.hide()
+            self._thresh_max_widget.hide()
 
     def _on_metric_changed(self, metric: str):
         is_tversky = (metric == "Tversky")
         self._tversky_label.setVisible(is_tversky)
         self._tversky_widget.setVisible(is_tversky)
+        self._thresh_max_label.setVisible(not is_tversky)
+        self._thresh_max_widget.setVisible(not is_tversky)
         self._thresh_label.setText("Threshold ≥")
 
     def get_params(self) -> dict:
@@ -1314,8 +1363,9 @@ class SearchParamsWidget(QGroupBox):
             "metric":      metric,
             "tversky_a":   self.tversky_a_spin.value(),
             "tversky_b":   self.tversky_b_spin.value(),
-            "threshold":   self.thresh_spin.value(),
-            "max_results": self.max_results.value(),
+            "threshold":     self.thresh_spin.value(),
+            "threshold_max": self.thresh_max_spin.value(),
+            "max_results":   self.max_results.value(),
             "n_workers":   self.n_workers.value(),
             "use_gpu":     self.gpu_check.isChecked() and GPU_OK,
         }
@@ -1935,18 +1985,26 @@ class SearchWidget(QWidget):
 
     def _on_search_done(self, results, elapsed: float):
         self._search_finished()
-        params  = self.params_widget.get_params()
-        n       = len(results) if results is not None else 0
-        metric  = params["metric"].capitalize()
-        max_r   = params["max_results"]
-        to_show = results[:max_r] if results is not None else []
+        params        = self.params_widget.get_params()
+        n_raw         = len(results) if results is not None else 0
+        metric        = params["metric"].capitalize()
+        max_r         = params["max_results"]
+        thresh_max    = params["threshold_max"]
+
+        filtered = results
+        if results is not None and thresh_max < 1.0:
+            filtered = [r for r in results if float(r[1]) <= thresh_max]
+        n_filtered = len(filtered) if filtered is not None else 0
+
+        to_show   = filtered[:max_r] if filtered is not None else []
         query_mol = Chem.MolFromSmiles(self.query_widget.get_smiles()) if RDKIT_OK else None
         self.results_table.populate(to_show, self._smiles_map, query_mol=query_mol)
 
-        total   = time.perf_counter() - self._t_search_start
-        s_str   = f"{elapsed * 1000:.1f} ms" if elapsed < 1 else f"{elapsed:.2f} s"
-        t_str   = f"{total * 1000:.1f} ms"   if total   < 1 else f"{total:.2f} s"
-        self.result_lbl.setText(f"{n:,} results  ·  {metric}  ·  search {s_str}  ·  total {t_str}")
+        total = time.perf_counter() - self._t_search_start
+        s_str = f"{elapsed * 1000:.1f} ms" if elapsed < 1 else f"{elapsed:.2f} s"
+        t_str = f"{total * 1000:.1f} ms"   if total   < 1 else f"{total:.2f} s"
+        n_str = f"{n_filtered:,}" if thresh_max < 1.0 else f"{n_raw:,}"
+        self.result_lbl.setText(f"{n_str} results  ·  {metric}  ·  search {s_str}  ·  total {t_str}")
 
     def _on_substruct_done(self, results: list, match_atoms: dict, elapsed: float):
         self._search_finished()
