@@ -115,7 +115,7 @@ Finds molecules with similar fingerprints to the query using a chosen metric:
 | Metric | Description |
 |--------|-------------|
 | **Tanimoto** | Standard Jaccard similarity — most common in cheminformatics |
-| **Dice** | `2|A∩B| / (|A|+|B|)` — gives higher scores than Tanimoto |
+| **Dice** | `2·\|A∩B\| / (\|A\|+\|B\|)` — gives higher scores than Tanimoto |
 | **Tversky** | Asymmetric; α=1, β=0 finds larger molecules containing your scaffold |
 
 Set the **Min** and **Max** threshold sliders to control the score range returned. Results are colour-coded green (score = 1.00) → yellow → orange → red (low similarity). The MCS (maximum common substructure) between the query and each hit is highlighted in the 2D thumbnail.
