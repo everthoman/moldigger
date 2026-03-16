@@ -81,6 +81,23 @@ FP_TYPES = {
     "Topological Torsion  (2048 bits)":            ("TopologicalTorsion", {"fpSize": 2048}),
 }
 
+def _compute_fp(mol, fp_type: str, fp_params: dict):
+    """Compute a bit-vector fingerprint matching the FPSim2 fp_type/fp_params convention."""
+    p = fp_params or {}
+    if fp_type == "Morgan":
+        return AllChem.GetMorganFingerprintAsBitVect(mol, p.get("radius", 2), nBits=p.get("fpSize", 2048))
+    elif fp_type == "RDKit":
+        return Chem.RDKFingerprint(mol, minPath=p.get("minPath", 1), maxPath=p.get("maxPath", 7), fpSize=p.get("fpSize", 2048))
+    elif fp_type == "MACCSKeys":
+        return rdMolDescriptors.GetMACCSKeysFingerprint(mol)
+    elif fp_type == "AtomPair":
+        return rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=p.get("fpSize", 2048))
+    elif fp_type == "TopologicalTorsion":
+        return rdMolDescriptors.GetHashedTopologicalTorsionFingerprintAsBitVect(mol, nBits=p.get("fpSize", 2048))
+    else:
+        return AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+
+
 EXAMPLE_SMILES = [
     ("— Quick examples —",              ""),
     ("Benzene",                          "c1ccccc1"),
@@ -164,18 +181,56 @@ def cleanup_jobs():
 # ── Molecule helpers ──────────────────────────────────────────────────────────
 
 def smiles_to_svg(smiles: str, width: int = 200, height: int = 150,
-                  highlight_atoms=None) -> str:
-    """Render SMILES to an SVG string (no XML header). Returns placeholder on failure."""
+                  highlight_atoms=None, highlight_bonds=None,
+                  query_mol=None, do_highlight: bool = True) -> str:
+    """Render SMILES to an SVG string (no XML header). Returns placeholder on failure.
+
+    highlight_atoms / highlight_bonds : explicit atom/bond index lists (substructure mode)
+    query_mol      : RDKit Mol — MCS is computed against this mol (similarity mode)
+    do_highlight   : set False to skip all highlighting
+    """
     if not RDKIT_OK or not smiles:
         return _placeholder_svg(width, height)
     try:
         mol = Chem.MolFromSmiles(smiles)
         if mol is None:
             return _placeholder_svg(width, height)
+        AllChem.Compute2DCoords(mol)
+
+        h_atoms, h_bonds = [], []
+
+        if do_highlight:
+            if highlight_atoms:
+                h_atoms = list(highlight_atoms)
+            elif query_mol is not None:
+                # MCS highlight for similarity results
+                try:
+                    from rdkit.Chem import rdFMCS
+                    res = rdFMCS.FindMCS(
+                        [query_mol, mol],
+                        timeout=1,
+                        ringMatchesRingOnly=False,
+                        completeRingsOnly=False,
+                    )
+                    if res.numAtoms > 1:
+                        patt = Chem.MolFromSmarts(res.smartsString)
+                        match = mol.GetSubstructMatch(patt)
+                        if match:
+                            h_atoms = list(match)
+                except Exception:
+                    pass
+
+            if h_atoms:
+                match_set = set(h_atoms)
+                h_bonds = [
+                    b.GetIdx() for b in mol.GetBonds()
+                    if b.GetBeginAtomIdx() in match_set and b.GetEndAtomIdx() in match_set
+                ]
+
         drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
         drawer.drawOptions().addStereoAnnotation = True
-        if highlight_atoms:
-            drawer.DrawMolecule(mol, highlightAtoms=list(highlight_atoms))
+        if h_atoms:
+            drawer.DrawMolecule(mol, highlightAtoms=h_atoms, highlightBonds=h_bonds)
         else:
             drawer.DrawMolecule(mol)
         drawer.FinishDrawing()
@@ -196,6 +251,55 @@ def _placeholder_svg(width: int, height: int) -> str:
         f'dominant-baseline="middle" fill="#adb5bd" font-size="12">No structure</text>'
         f'</svg>'
     )
+
+
+def assign_cluster_ids_from_smiles(smiles_list: list, cutoff: float = 0.4) -> list:
+    """Butina-cluster a list of SMILES. Returns list of cluster_id (int|None)."""
+    dummy_rows = [{"smiles": s} for s in smiles_list]
+    assign_cluster_ids(dummy_rows, cutoff=cutoff)
+    return [r["cluster_id"] for r in dummy_rows]
+
+
+def assign_cluster_ids(rows: list, cutoff: float = 0.4) -> None:
+    """Butina-cluster rows in-place using Morgan ECFP4 (best general-purpose clustering FP).
+    cutoff is a similarity threshold. Adds 'cluster_id' (int) to each row dict."""
+    if not RDKIT_OK or not rows:
+        for r in rows:
+            r["cluster_id"] = None
+        return
+    try:
+        from rdkit.ML.Cluster import Butina
+        from rdkit import DataStructs
+
+        smiles_list = [r["smiles"] for r in rows]
+        fps, valid_idx = [], []
+        for i, smi in enumerate(smiles_list):
+            mol = Chem.MolFromSmiles(smi) if smi else None
+            if mol:
+                fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048))
+                valid_idx.append(i)
+
+        n = len(fps)
+        dists = []
+        for i in range(1, n):
+            sims = DataStructs.BulkTanimotoSimilarity(fps[i], fps[:i])
+            dists.extend(1.0 - s for s in sims)
+
+        clusters = Butina.ClusterData(dists, n, 1.0 - cutoff, isDistData=True)
+
+        pos_to_cid = {}   # position-in-fps → cluster_id
+        for cid, members in enumerate(clusters, start=1):
+            for pos in members:
+                pos_to_cid[pos] = cid
+
+        orig_to_pos = {orig: pos for pos, orig in enumerate(valid_idx)}
+        for i, row in enumerate(rows):
+            pos = orig_to_pos.get(i)
+            row["cluster_id"] = pos_to_cid.get(pos) if pos is not None else None
+    except Exception:
+        log.exception("Clustering failed")
+        for r in rows:
+            r["cluster_id"] = None
 
 
 def compute_props(smiles: str) -> dict:
@@ -233,7 +337,8 @@ def _fp_name_from_engine(engine) -> str:
 
 # ── Result builder ────────────────────────────────────────────────────────────
 
-def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None) -> list:
+def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None,
+                       query_mol=None, do_highlight: bool = True) -> list:
     rows = []
     for mol_id, score in hits:
         key = str(mol_id)
@@ -245,7 +350,9 @@ def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None) -> 
         atoms = None
         if match_atoms:
             atoms = match_atoms.get(int(mol_id)) or match_atoms.get(str(mol_id))
-        svg = smiles_to_svg(smiles, width=150, height=110, highlight_atoms=atoms)
+        svg = smiles_to_svg(smiles, width=150, height=110,
+                            highlight_atoms=atoms, query_mol=query_mol,
+                            do_highlight=do_highlight)
         props = compute_props(smiles)
         rows.append({
             "mol_id": int(mol_id),
@@ -262,7 +369,8 @@ def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None) -> 
 
 def _run_similarity_search(jid: str, smiles: str, threshold: float, threshold_max: float,
                            n_workers: int, use_gpu: bool, metric: str,
-                           tversky_a: float, tversky_b: float, max_results: int):
+                           tversky_a: float, tversky_b: float, max_results: int,
+                           do_highlight: bool = True):
     try:
         update_job_progress(jid, "Starting similarity search…")
         with _state_lock:
@@ -302,7 +410,10 @@ def _run_similarity_search(jid: str, smiles: str, threshold: float, threshold_ma
         if max_results > 0:
             hits = hits[:max_results]
 
-        rows = _build_result_rows(hits, mol_map)
+        query_mol = Chem.MolFromSmiles(smiles) if (RDKIT_OK and do_highlight) else None
+        rows = _build_result_rows(hits, mol_map, query_mol=query_mol, do_highlight=do_highlight)
+        for r in rows:
+            r["cluster_id"] = None
         finish_job(jid, result={"rows": rows, "total": len(results), "elapsed": elapsed})
 
     except Exception as exc:
@@ -310,7 +421,8 @@ def _run_similarity_search(jid: str, smiles: str, threshold: float, threshold_ma
         finish_job(jid, error=str(exc))
 
 
-def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: int):
+def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: int,
+                             do_highlight: bool = True):
     try:
         update_job_progress(jid, "Starting substructure search…")
         with _state_lock:
@@ -366,7 +478,9 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
         if max_results > 0:
             hits = hits[:max_results]
 
-        rows = _build_result_rows(hits, mol_map, match_atoms=match_atoms)
+        rows = _build_result_rows(hits, mol_map, match_atoms=match_atoms, do_highlight=do_highlight)
+        for r in rows:
+            r["cluster_id"] = None
         finish_job(jid, result={"rows": rows, "total": len(all_results), "elapsed": elapsed})
 
     except Exception as exc:
@@ -477,6 +591,7 @@ class SearchRequest(BaseModel):
     n_workers: int = 4
     use_gpu: bool = False
     max_results: int = 200
+    highlight: bool = True
 
 # ── FastAPI routes ─────────────────────────────────────────────────────────────
 
@@ -548,7 +663,8 @@ def api_search(req: SearchRequest):
     if not smiles:
         return JSONResponse({"error": "smiles is required"}, status_code=400)
 
-    fp = req.fp or list(FP_TYPES.keys())[0]
+    fp_name = req.fp or list(FP_TYPES.keys())[0]
+    fp_type, fp_params = FP_TYPES.get(fp_name, ("Morgan", {"radius": 2, "fpSize": 2048}))
 
     if req.search_type == "substructure":
         if not RDKIT_OK:
@@ -556,7 +672,7 @@ def api_search(req: SearchRequest):
         jid = new_job()
         threading.Thread(
             target=_run_substructure_search,
-            args=(jid, smiles, req.n_workers, req.max_results),
+            args=(jid, smiles, req.n_workers, req.max_results, req.highlight),
             daemon=True,
         ).start()
     else:
@@ -566,7 +682,7 @@ def api_search(req: SearchRequest):
         threading.Thread(
             target=_run_similarity_search,
             args=(jid, smiles, req.threshold, req.threshold_max, req.n_workers, req.use_gpu,
-                  req.metric, req.tversky_a, req.tversky_b, req.max_results),
+                  req.metric, req.tversky_a, req.tversky_b, req.max_results, req.highlight),
             daemon=True,
         ).start()
 
@@ -630,6 +746,16 @@ async def api_build_db(request: Request):
     return {"job_id": jid}
 
 
+class ClusterRequest(BaseModel):
+    smiles: list[str]
+    cutoff: float = 0.4
+
+@app.post("/api/cluster")
+def api_cluster(req: ClusterRequest):
+    cluster_ids = assign_cluster_ids_from_smiles(req.smiles, cutoff=req.cutoff)
+    return {"cluster_ids": cluster_ids}
+
+
 @app.get("/api/mol_svg")
 def api_mol_svg(smiles: str = Query(""), w: int = Query(300), h: int = Query(200)):
     svg = smiles_to_svg(smiles, width=w, height=h)
@@ -682,7 +808,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MolDigger Web</title>
+<title>MolDigger — Ultrafast Molecular Structure Searching & Clustering</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -1133,7 +1259,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <!-- Header -->
 <header class="header">
   <div class="header-logo">
-    <span class="hex">⬡</span> MolDigger Web
+    <span class="hex">⬡</span> MolDigger — Ultrafast Molecular Structure Searching &amp; Clustering
   </div>
   <div class="header-pills" id="status-pills">
     <span class="pill err" id="pill-rdkit">RDKit</span>
@@ -1269,13 +1395,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <div>
             <label>Min similarity: <span id="thresh-val">0.70</span></label>
             <div class="slider-row">
-              <input type="range" id="threshold" min="0.1" max="1.0" step="0.01" value="0.7"
+              <input type="range" id="threshold" min="0.01" max="1.0" step="0.01" value="0.7"
                      oninput="onThreshChange()">
             </div>
             <div id="thresh-max-row">
               <label>Max similarity: <span id="thresh-max-val">1.00</span></label>
               <div class="slider-row">
-                <input type="range" id="threshold-max" min="0.1" max="1.0" step="0.01" value="1.0"
+                <input type="range" id="threshold-max" min="0.01" max="1.0" step="0.01" value="1.0"
                        oninput="onThreshMaxChange()">
               </div>
             </div>
@@ -1302,6 +1428,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </label>
         </div>
 
+        <!-- Highlight checkbox -->
+        <div>
+          <label style="display:flex; align-items:center; gap:8px; flex-direction:row; margin:0;">
+            <input type="checkbox" id="highlight" checked> Highlight matching atoms
+          </label>
+        </div>
+
+
         <!-- Search button -->
         <button class="btn btn-search" id="search-btn" onclick="doSearch()">
           <span class="spinner" id="search-spinner"></span>
@@ -1326,6 +1460,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button class="btn btn-ghost btn-sm" onclick="exportCsv()">⬇ Export CSV</button>
     </div>
 
+    <!-- Cluster bar — shown after results arrive -->
+    <div id="cluster-bar" style="display:none; align-items:center; gap:10px; padding:6px 0; flex-wrap:wrap;">
+      <span style="font-weight:600;">Cluster:</span>
+      <label for="cluster-cutoff" title="Molecules with Tanimoto ≥ this value are in the same cluster. Higher = more/smaller clusters.">Min similarity</label>
+      <input type="range" id="cluster-cutoff" min="0.1" max="0.9" step="0.05" value="0.4" style="width:120px;"
+             oninput="document.getElementById('cluster-cutoff-val').textContent=parseFloat(this.value).toFixed(2)">
+      <span id="cluster-cutoff-val" style="min-width:2.5em;">0.40</span>
+      <button class="btn btn-primary btn-sm" onclick="doClustering()">Apply Clustering</button>
+      <button class="btn btn-ghost btn-sm" onclick="clearClusters()">Clear</button>
+    </div>
+
     <!-- Placeholder -->
     <div class="placeholder" id="placeholder">
       <div class="big-icon">⬡</div>
@@ -1338,6 +1483,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <thead>
           <tr>
             <th class="row-num">#</th>
+            <th class="cluster-col" style="display:none;" onclick="sortTable('cluster_id')" title="Butina cluster ID">Cluster</th>
             <th class="sortable" onclick="sortTable('name')">Name <span class="sort-icon"></span></th>
             <th>Structure</th>
             <th class="sortable" id="score-header" onclick="sortTable('score')">Score <span class="sort-icon"></span></th>
@@ -1674,6 +1820,7 @@ function doSearch() {
     n_workers: parseInt(document.getElementById('n-workers').value),
     use_gpu: document.getElementById('use-gpu').checked,
     max_results: parseInt(document.getElementById('max-results').value),
+    highlight: document.getElementById('highlight').checked,
   };
 
   fetch('/api/search', {
@@ -1765,8 +1912,14 @@ function renderResults(data) {
   const scoreHeader = document.getElementById('score-header');
   if (scoreHeader) scoreHeader.childNodes[0].textContent = metricLabel + ' ';
 
+  // Show cluster column only when results have cluster IDs
+  const hasClusters = currentResults.length > 0 && currentResults[0].cluster_id !== null;
+  const clusterDisplay = hasClusters ? '' : 'none';
+  document.querySelectorAll('.cluster-col').forEach(el => el.style.display = clusterDisplay);
+
   document.getElementById('placeholder').style.display = 'none';
   document.getElementById('results-header').style.display = 'flex';
+  document.getElementById('cluster-bar').style.display = currentResults.length > 0 ? 'flex' : 'none';
   document.getElementById('table-wrap').style.display = 'block';
 
   document.getElementById('hit-count').textContent = total.toLocaleString();
@@ -1809,8 +1962,10 @@ function _renderTable() {
       scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(2) + '</span>';
     }
 
+    const clusterDisplay = (row.cluster_id !== null && row.cluster_id !== undefined) ? '' : 'none';
     tr.innerHTML =
       '<td class="row-num">' + (i + 1) + '</td>' +
+      '<td class="cluster-col prop-cell" style="display:' + clusterDisplay + ';">' + (row.cluster_id !== null && row.cluster_id !== undefined ? row.cluster_id : '') + '</td>' +
       '<td class="name-cell" title="' + escHtml(row.name || '') + '">' + escHtml(truncate(row.name || '', 24)) + '</td>' +
       '<td class="struct-cell">' + (row.svg || '') + '</td>' +
       '<td>' + scoreHtml + '</td>' +
@@ -1830,7 +1985,49 @@ function _renderTable() {
 
 function scoreStyle(score) {
   const hue = Math.round(score * 120);
-  return 'background:hsl(' + hue + ',75%,88%);color:hsl(' + hue + ',70%,26%)';
+  return 'background:hsl(' + hue + ',100%,67%);color:hsl(' + hue + ',80%,22%)';
+}
+
+// ── Clustering ─────────────────────────────────────────────────────────────
+function doClustering() {
+  if (!currentResults.length) return;
+  const cutoff = parseFloat(document.getElementById('cluster-cutoff').value);
+  const smiles = currentResults.map(function(r) { return r.smiles || ''; });
+  const btn = document.querySelector('#cluster-bar .btn-primary');
+  btn.disabled = true;
+  btn.textContent = 'Clustering…';
+  fetch('/api/cluster', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({smiles: smiles, cutoff: cutoff})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) { alert('Clustering failed: ' + d.error); return; }
+      const ids = d.cluster_ids;
+      // Assign cluster_ids back to currentResults in their current order
+      currentResults.forEach(function(row, i) { row.cluster_id = ids[i] !== null ? ids[i] : null; });
+      // Sort by cluster then score
+      currentResults.sort(function(a, b) {
+        const ca = a.cluster_id !== null ? a.cluster_id : 999999;
+        const cb = b.cluster_id !== null ? b.cluster_id : 999999;
+        if (ca !== cb) return ca - cb;
+        return b.score - a.score;
+      });
+      const hasClusters = ids.some(function(id) { return id !== null; });
+      document.querySelectorAll('.cluster-col').forEach(function(el) {
+        el.style.display = hasClusters ? '' : 'none';
+      });
+      _renderTable();
+    })
+    .catch(function(e) { alert('Clustering error: ' + e); })
+    .finally(function() { btn.disabled = false; btn.textContent = 'Apply Clustering'; });
+}
+
+function clearClusters() {
+  currentResults.forEach(function(r) { r.cluster_id = null; });
+  document.querySelectorAll('.cluster-col').forEach(function(el) { el.style.display = 'none'; });
+  _renderTable();
 }
 
 // ── Sort ───────────────────────────────────────────────────────────────────

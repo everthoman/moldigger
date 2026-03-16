@@ -180,6 +180,23 @@ FP_TYPES: dict = {
     "Topological Torsion  (2048 bits)":            ("TopologicalTorsion", {"fpSize": 2048}),
 }
 
+def _compute_fp(mol, fp_type: str, fp_params: dict):
+    """Compute a bit-vector fingerprint matching the FPSim2 fp_type/fp_params convention."""
+    p = fp_params or {}
+    if fp_type == "Morgan":
+        return AllChem.GetMorganFingerprintAsBitVect(mol, p.get("radius", 2), nBits=p.get("fpSize", 2048))
+    elif fp_type == "RDKit":
+        return Chem.RDKFingerprint(mol, minPath=p.get("minPath", 1), maxPath=p.get("maxPath", 7), fpSize=p.get("fpSize", 2048))
+    elif fp_type == "MACCSKeys":
+        return rdMolDescriptors.GetMACCSKeysFingerprint(mol)
+    elif fp_type == "AtomPair":
+        return rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=p.get("fpSize", 2048))
+    elif fp_type == "TopologicalTorsion":
+        return rdMolDescriptors.GetHashedTopologicalTorsionFingerprintAsBitVect(mol, nBits=p.get("fpSize", 2048))
+    else:
+        return AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+
+
 def _fp_name_from_engine(fp_type: str, fp_params: dict) -> str | None:
     """Return the FP_TYPES display name that best matches an engine's fp_type/fp_params."""
     for name, (t, p) in FP_TYPES.items():
@@ -340,6 +357,49 @@ class DBCreationWorker(QThread):
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+
+# ── Butina clustering helper ──────────────────────────────────────────────────
+
+def cluster_molecules(smiles_list: list, cutoff: float = 0.4) -> list:
+    """Butina-cluster molecules using Morgan ECFP4 (best general-purpose clustering FP).
+    cutoff is a similarity threshold (higher = more/smaller clusters).
+    Returns list of cluster_id (int|None) per input SMILES."""
+    if not RDKIT_OK or not smiles_list:
+        return [None] * len(smiles_list)
+    try:
+        from rdkit.ML.Cluster import Butina
+        from rdkit import DataStructs
+
+        fps, valid_idx = [], []
+        for i, smi in enumerate(smiles_list):
+            mol = Chem.MolFromSmiles(smi) if smi else None
+            if mol:
+                fps.append(AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048))
+                valid_idx.append(i)
+
+        n = len(fps)
+        dists = []
+        for i in range(1, n):
+            sims = DataStructs.BulkTanimotoSimilarity(fps[i], fps[:i])
+            dists.extend(1.0 - s for s in sims)
+
+        clusters = Butina.ClusterData(dists, n, 1.0 - cutoff, isDistData=True)
+
+        pos_to_cid = {}
+        for cid, members in enumerate(clusters, start=1):
+            for pos in members:
+                pos_to_cid[pos] = cid
+
+        orig_to_pos = {orig: pos for pos, orig in enumerate(valid_idx)}
+        result = []
+        for i in range(len(smiles_list)):
+            pos = orig_to_pos.get(i)
+            result.append(pos_to_cid.get(pos) if pos is not None else None)
+        return result
+    except Exception:
+        log.exception("Clustering failed")
+        return [None] * len(smiles_list)
 
 
 # ── Worker: similarity search ─────────────────────────────────────────────────
@@ -1252,9 +1312,11 @@ class SearchParamsWidget(QGroupBox):
 
         # Max threshold (upper bound)
         thresh_max_row = QHBoxLayout()
+        thresh_max_row.setContentsMargins(0, 0, 0, 0)
         self.thresh_max_slider = QSlider(Qt.Horizontal)
         self.thresh_max_slider.setRange(1, 100)
         self.thresh_max_slider.setValue(100)
+        self.thresh_max_slider.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.thresh_max_spin = QDoubleSpinBox()
         self.thresh_max_spin.setRange(0.01, 1.0)
         self.thresh_max_spin.setSingleStep(0.01)
@@ -1305,6 +1367,11 @@ class SearchParamsWidget(QGroupBox):
         self.gpu_check = QCheckBox(gpu_label)
         self.gpu_check.setEnabled(GPU_OK)
         form.addRow("Acceleration:", self.gpu_check)
+
+        # Highlight matching atoms
+        self.highlight_check = QCheckBox("Highlight matching atoms")
+        self.highlight_check.setChecked(True)
+        form.addRow("Display:", self.highlight_check)
 
         # Connect after all widgets exist so the signal handler can reference them safely
         self.search_type.currentTextChanged.connect(self._on_search_type_changed)
@@ -1367,8 +1434,9 @@ class SearchParamsWidget(QGroupBox):
             "threshold":     self.thresh_spin.value(),
             "threshold_max": self.thresh_max_spin.value(),
             "max_results":   self.max_results.value(),
-            "n_workers":   self.n_workers.value(),
-            "use_gpu":     self.gpu_check.isChecked() and GPU_OK,
+            "n_workers":      self.n_workers.value(),
+            "use_gpu":        self.gpu_check.isChecked() and GPU_OK,
+            "highlight":      self.highlight_check.isChecked(),
         }
 
 
@@ -1382,8 +1450,8 @@ class ResultsTable(QTableWidget):
 
     use_as_query = pyqtSignal(str)   # emitted with SMILES when "Use as Query" is chosen
 
-    _COLS = ["#", "Name", "Structure", "Score", "MW", "ClogP", "SMILES"]
-    _COL_SMILES = 6
+    _COLS = ["#", "Cluster", "Name", "Structure", "Score", "MW", "ClogP", "SMILES"]
+    _COL_SMILES = 7
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1396,14 +1464,16 @@ class ResultsTable(QTableWidget):
         self.setHorizontalHeaderLabels(self._COLS)
         hh = self.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)   # rank
-        hh.setSectionResizeMode(1, QHeaderView.Interactive)        # name
-        hh.setSectionResizeMode(2, QHeaderView.Fixed)              # structure
-        hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)   # score
-        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)   # MW
-        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)   # ClogP
-        hh.setSectionResizeMode(6, QHeaderView.Stretch)            # SMILES
-        self.setColumnWidth(1, 160)
-        self.setColumnWidth(2, RESULT_IMG_SIZE + 6)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)   # cluster
+        hh.setSectionResizeMode(2, QHeaderView.Interactive)        # name
+        hh.setSectionResizeMode(3, QHeaderView.Fixed)              # structure
+        hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)   # score
+        hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)   # MW
+        hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)   # ClogP
+        hh.setSectionResizeMode(7, QHeaderView.Stretch)            # SMILES
+        self.setColumnWidth(2, 160)
+        self.setColumnWidth(3, RESULT_IMG_SIZE + 6)
+        self.setColumnHidden(1, True)   # hidden until clustering is used
         self.verticalHeader().setDefaultSectionSize(RESULT_IMG_SIZE + 6)
         self.verticalHeader().setVisible(False)
         self.setSelectionBehavior(QTableWidget.SelectRows)
@@ -1433,27 +1503,39 @@ class ResultsTable(QTableWidget):
         elif action == act_query:
             self.use_as_query.emit(smiles)
 
-    def populate(self, results, mol_map: dict, query_mol=None, highlight_map=None, metric: str = "Score"):
+    def populate(self, results, mol_map: dict, query_mol=None, highlight_map=None,
+                 metric: str = "Score", cluster_ids: list = None):
         """
-        results       : numpy structured array with (mol_id, coeff) OR list of (mol_id, score)
-        mol_map       : {int(mol_id): {"smiles": str, "name": str}}
-        query_mol     : optional RDKit Mol — used to highlight MCS in hit thumbnails
+        results     : numpy structured array with (mol_id, coeff) OR list of (mol_id, score)
+        mol_map     : {int(mol_id): {"smiles": str, "name": str}}
+        query_mol   : optional RDKit Mol — used to highlight MCS in hit thumbnails
         highlight_map : optional {int(mol_id): [atom_indices]} — direct substructure highlights
-                        (takes priority over MCS when provided)
-                  OR legacy {int(mol_id): smiles_str}
-        metric        : label shown in the Score column header
+        metric      : label shown in the Score column header
+        cluster_ids : optional list of int|None, same length/order as results after sort
         """
-        self.setHorizontalHeaderItem(3, QTableWidgetItem(metric))
+        self.setHorizontalHeaderItem(4, QTableWidgetItem(metric))
         self.setSortingEnabled(False)
         self.clearContents()
         self.setRowCount(0)
 
         if results is None or len(results) == 0:
+            self.setColumnHidden(1, True)
             return
 
-        sorted_res = sorted(results, key=lambda r: float(r[1]), reverse=True)
+        has_clusters = cluster_ids is not None and any(c is not None for c in cluster_ids)
+        self.setColumnHidden(1, not has_clusters)
 
-        for rank, row_data in enumerate(sorted_res, start=1):
+        if has_clusters:
+            # Sort by (cluster_id, score desc) when clustering is active
+            paired = list(zip(results, cluster_ids))
+            paired.sort(key=lambda t: (t[1] or 999999, -float(t[0][1])))
+            sorted_res = [p[0] for p in paired]
+            sorted_cids = [p[1] for p in paired]
+        else:
+            sorted_res  = sorted(results, key=lambda r: float(r[1]), reverse=True)
+            sorted_cids = [None] * len(sorted_res)
+
+        for rank, (row_data, cid) in enumerate(zip(sorted_res, sorted_cids), start=1):
             mol_id = int(row_data[0])
             score  = float(row_data[1])
             row    = self.rowCount()
@@ -1469,16 +1551,23 @@ class ResultsTable(QTableWidget):
                 smiles = entry
                 name   = str(mol_id)
 
-            # --- Rank ---
+            # --- Rank (col 0) ---
             rank_item = QTableWidgetItem()
             rank_item.setData(Qt.DisplayRole, rank)
             rank_item.setTextAlignment(Qt.AlignCenter)
             self.setItem(row, 0, rank_item)
 
-            # --- Name / identifier ---
-            self.setItem(row, 1, QTableWidgetItem(name))
+            # --- Cluster (col 1) ---
+            if cid is not None:
+                cid_item = QTableWidgetItem()
+                cid_item.setData(Qt.DisplayRole, cid)
+                cid_item.setTextAlignment(Qt.AlignCenter)
+                self.setItem(row, 1, cid_item)
 
-            # --- Structure thumbnail (col 2) ---
+            # --- Name / identifier (col 2) ---
+            self.setItem(row, 2, QTableWidgetItem(name))
+
+            # --- Structure thumbnail (col 3) ---
             if smiles and RDKIT_OK:
                 mol = Chem.MolFromSmiles(smiles)
                 if mol:
@@ -1488,19 +1577,19 @@ class ResultsTable(QTableWidget):
                         thumb.render_mol(mol, highlight_atoms=h_atoms)
                     else:
                         thumb.render_mol(mol, query_mol=query_mol)
-                    self.setCellWidget(row, 2, thumb)
+                    self.setCellWidget(row, 3, thumb)
 
                     mw_item = QTableWidgetItem()
                     mw_item.setData(Qt.DisplayRole, round(Descriptors.MolWt(mol), 2))
                     mw_item.setTextAlignment(Qt.AlignCenter)
-                    self.setItem(row, 4, mw_item)
+                    self.setItem(row, 5, mw_item)
 
                     clogp_item = QTableWidgetItem()
                     clogp_item.setData(Qt.DisplayRole, round(Descriptors.MolLogP(mol), 2))
                     clogp_item.setTextAlignment(Qt.AlignCenter)
-                    self.setItem(row, 5, clogp_item)
+                    self.setItem(row, 6, clogp_item)
 
-            # --- Score (col 3) ---
+            # --- Score (col 4) ---
             score_item = QTableWidgetItem()
             if highlight_map is not None:
                 score_item.setData(Qt.DisplayRole, "match")
@@ -1509,17 +1598,17 @@ class ResultsTable(QTableWidget):
                 score_item.setData(Qt.DisplayRole, f"{score:.2f}")
                 score_item.setBackground(QColor.fromHsvF(score / 3.0, 0.65, 1.0))
             score_item.setTextAlignment(Qt.AlignCenter)
-            self.setItem(row, 3, score_item)
+            self.setItem(row, 4, score_item)
 
-            # --- SMILES (col 6) ---
-            self.setItem(row, 6, QTableWidgetItem(smiles))
+            # --- SMILES (col 7) ---
+            self.setItem(row, 7, QTableWidgetItem(smiles))
 
         self.setSortingEnabled(True)
-        self.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        self.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
 
     def export_csv(self, path: str):
         import csv
-        skip_cols = {2}   # skip the structure image column
+        skip_cols = {3}   # skip the structure image column
         with open(path, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
             writer.writerow(
@@ -1531,6 +1620,39 @@ class ResultsTable(QTableWidget):
                     (self.item(r, c).text() if self.item(r, c) else "")
                     for c in range(self.columnCount()) if c not in skip_cols
                 )
+
+    def update_clusters(self, cluster_ids: list) -> None:
+        """Update cluster column in-place without re-rendering thumbnails.
+        cluster_ids is ordered to match the original populate() call order.
+        Uses the rank (col 0) to map visual rows back to original order."""
+        has = any(c is not None for c in cluster_ids)
+        self.setColumnHidden(1, not has)
+        if not has:
+            return
+        self.setSortingEnabled(False)
+        for row in range(self.rowCount()):
+            rank_item = self.item(row, 0)
+            if rank_item is None:
+                continue
+            rank = rank_item.data(Qt.DisplayRole)   # 1-indexed original position
+            cid = cluster_ids[rank - 1] if rank is not None and rank <= len(cluster_ids) else None
+            if cid is not None:
+                item = QTableWidgetItem()
+                item.setData(Qt.DisplayRole, cid)
+                item.setTextAlignment(Qt.AlignCenter)
+                self.setItem(row, 1, item)
+            else:
+                self.setItem(row, 1, QTableWidgetItem(""))
+        self.setSortingEnabled(True)
+        self.sortByColumn(1, Qt.AscendingOrder)
+
+    def clear_clusters(self) -> None:
+        """Remove all cluster IDs and hide the cluster column."""
+        self.setSortingEnabled(False)
+        for row in range(self.rowCount()):
+            self.setItem(row, 1, QTableWidgetItem(""))
+        self.setColumnHidden(1, True)
+        self.setSortingEnabled(True)
 
 
 # ── Database panel ────────────────────────────────────────────────────────────
@@ -1774,6 +1896,7 @@ class SearchWidget(QWidget):
         self._worker: SearchWorker | None = None
         self._searching: bool = False
         self._t_search_start: float = 0.0
+        self._last_to_show: list = []   # cached result rows for re-clustering
         self._build_ui()
 
     def _build_ui(self):
@@ -1835,6 +1958,33 @@ class SearchWidget(QWidget):
         btn_export.clicked.connect(self._export_csv)
         hdr.addWidget(btn_export)
         right_layout.addLayout(hdr)
+
+        # Cluster toolbar (shown only when results exist)
+        self._cluster_bar = QWidget()
+        cluster_bar_layout = QHBoxLayout(self._cluster_bar)
+        cluster_bar_layout.setContentsMargins(0, 2, 0, 2)
+        cluster_bar_layout.setSpacing(6)
+        cluster_bar_layout.addWidget(QLabel("Cluster:"))
+        self._cluster_cutoff_spin = QDoubleSpinBox()
+        self._cluster_cutoff_spin.setRange(0.1, 0.9)
+        self._cluster_cutoff_spin.setSingleStep(0.05)
+        self._cluster_cutoff_spin.setDecimals(2)
+        self._cluster_cutoff_spin.setValue(0.4)
+        self._cluster_cutoff_spin.setMaximumWidth(72)
+        self._cluster_cutoff_spin.setToolTip(
+            "Min similarity to be in same cluster (higher = more/smaller clusters)"
+        )
+        cluster_bar_layout.addWidget(QLabel("Min similarity"))
+        cluster_bar_layout.addWidget(self._cluster_cutoff_spin)
+        self._btn_cluster = QPushButton("Apply Clustering")
+        self._btn_cluster.clicked.connect(self._do_cluster)
+        cluster_bar_layout.addWidget(self._btn_cluster)
+        self._btn_clear_cluster = QPushButton("Clear")
+        self._btn_clear_cluster.clicked.connect(self._clear_clusters)
+        cluster_bar_layout.addWidget(self._btn_clear_cluster)
+        cluster_bar_layout.addStretch()
+        self._cluster_bar.hide()
+        right_layout.addWidget(self._cluster_bar)
 
         self.results_table = ResultsTable()
         self.results_table.use_as_query.connect(self.query_widget.set_smiles)
@@ -1934,9 +2084,23 @@ class SearchWidget(QWidget):
         )
         self.progress.hide()
 
+    def _disconnect_worker(self):
+        """Disconnect all signals from the current worker so stale deliveries are ignored."""
+        if self._worker is None:
+            return
+        try:
+            self._worker.finished.disconnect()
+        except TypeError:
+            pass
+        try:
+            self._worker.error.disconnect()
+        except TypeError:
+            pass
+
     def _stop_search(self):
         if self._worker is None:
             return
+        self._disconnect_worker()
         if isinstance(self._worker, SubstructureSearchWorker):
             self._worker.cancel()
         else:
@@ -1953,6 +2117,9 @@ class SearchWidget(QWidget):
         if not query:
             QMessageBox.warning(self, "No Query", "Please enter a SMILES or SMARTS query.")
             return
+
+        # Disconnect any previous worker so it can't deliver stale results to this search
+        self._disconnect_worker()
 
         params = self.params_widget.get_params()
 
@@ -1987,11 +2154,11 @@ class SearchWidget(QWidget):
 
     def _on_search_done(self, results, elapsed: float):
         self._search_finished()
-        params        = self.params_widget.get_params()
-        n_raw         = len(results) if results is not None else 0
-        metric        = params["metric"].capitalize()
-        max_r         = params["max_results"]
-        thresh_max    = params["threshold_max"]
+        params     = self.params_widget.get_params()
+        n_raw      = len(results) if results is not None else 0
+        metric     = params["metric"].capitalize()
+        max_r      = params["max_results"]
+        thresh_max = params["threshold_max"]
 
         filtered = results
         if results is not None and thresh_max < 1.0:
@@ -1999,9 +2166,13 @@ class SearchWidget(QWidget):
         n_filtered = len(filtered) if filtered is not None else 0
 
         to_show   = filtered[:max_r] if filtered is not None else []
-        query_mol = Chem.MolFromSmiles(self.query_widget.get_smiles()) if RDKIT_OK else None
+        self._last_to_show = list(to_show)
+        query_mol = (Chem.MolFromSmiles(self.query_widget.get_smiles())
+                     if (RDKIT_OK and params["highlight"]) else None)
+
         self.results_table.populate(to_show, self._smiles_map, query_mol=query_mol,
                                     metric=params["metric"].capitalize())
+        self._cluster_bar.setVisible(len(to_show) > 0)
 
         total = time.perf_counter() - self._t_search_start
         s_str = f"{elapsed * 1000:.1f} ms" if elapsed < 1 else f"{elapsed:.2f} s"
@@ -2017,9 +2188,14 @@ class SearchWidget(QWidget):
         max_r   = params["max_results"]
         to_show = results[:max_r]
         n_shown = len(to_show)
+        self._last_to_show = list(to_show)
+
         self.results_table.populate(
-            to_show, self._smiles_map, highlight_map=match_atoms, metric="Substructure"
+            to_show, self._smiles_map,
+            highlight_map=match_atoms if params["highlight"] else None,
+            metric="Substructure",
         )
+        self._cluster_bar.setVisible(len(to_show) > 0)
 
         total  = time.perf_counter() - self._t_search_start
         s_str  = f"{elapsed * 1000:.1f} ms" if elapsed < 1 else f"{elapsed:.2f} s"
@@ -2027,6 +2203,21 @@ class SearchWidget(QWidget):
         hits   = f"{n_total:,} substructure hits"
         shown  = f"  ·  showing {n_shown:,}" if n_shown < n_total else ""
         self.result_lbl.setText(f"{hits}{shown}  ·  search {s_str}  ·  total {t_str}")
+
+    def _do_cluster(self):
+        if not self._last_to_show:
+            return
+        smiles_list = []
+        for r in self._last_to_show:
+            mid = int(r[0])
+            e = self._smiles_map.get(mid, {})
+            smiles_list.append(e.get("smiles", "") if isinstance(e, dict) else str(e))
+        cutoff = self._cluster_cutoff_spin.value()
+        cluster_ids = cluster_molecules(smiles_list, cutoff=cutoff)
+        self.results_table.update_clusters(cluster_ids)
+
+    def _clear_clusters(self):
+        self._last_to_show and self.results_table.clear_clusters()
 
     def _on_search_error(self, msg: str):
         self._search_finished()
@@ -2057,39 +2248,56 @@ def _build_about() -> QWidget:
     text = QTextEdit()
     text.setReadOnly(True)
     text.setMarkdown(f"""
-# MolDigger — Ultrafast Molecular Structure Search
+# MolDigger — Ultrafast Molecular Structure Searching & Clustering
 
 ## Quick Start
 1. **Database tab** → load an existing `.h5` file, or create one from an SDF/SMILES file
 2. **Structure Search tab** → enter a SMILES or SMARTS query (live 2D preview updates as you type)
 3. Choose search type: **Similarity** or **Substructure**
-4. Click **Search** — results are sorted by score with 2D thumbnails
-5. Click **Search** again while a search is running to **stop** it
+4. Click **Search** — results appear sorted by score with 2D thumbnails
+5. Optionally click **Apply Clustering** above the results table to group hits by structural similarity
+6. Click **Search** again while a search is running to **stop** it
 
 ---
 
 ## Search Types
 
 ### Similarity Search
-Finds molecules with similar fingerprints to your query using the Tanimoto coefficient.
+Finds molecules with similar fingerprints to your query.
 - Enter any valid **SMILES** string as the query
-- Set the **Tanimoto threshold** (0–1): only molecules scoring above this value are returned
-- Results are coloured green (≥1.00) → yellow → orange → red (low similarity)
-- Choose a **fingerprint type** and **CPU workers** in the parameters panel
-- Enable **GPU** (CUDA) for large databases (requires `cupy` and a supported GPU)
+- Set the **Threshold ≥** (min similarity, 0.01–1.0): only molecules scoring at or above this are returned
+- Set the **Threshold ≤** (max similarity, 0.01–1.0): filter out molecules too similar to the query (e.g. exact matches)
+- Choose a **metric**: Tanimoto (default), Dice, or Tversky (with custom α/β weights)
+- Choose a **fingerprint type** — loaded databases auto-select the matching fingerprint
+- Results are colour-coded: green (high similarity) → red (low similarity)
+- Matching atoms are **highlighted** on each thumbnail (toggle with "Highlight matching atoms")
+- Enable **GPU** (CUDA) for large databases (Tanimoto only; requires `cupy` and a supported GPU)
 
 ### Substructure Search
 Finds all molecules containing your query as a substructure.
 - Enter a **SMILES** or **SMARTS** query — SMARTS is preferred for flexible matching
 - SMARTS examples:
   - `c1ccccc1` — any benzene ring
-  - `[#6]-C(=O)-[#7]` — amide bond (any carbon-nitrogen)
+  - `[#6]-C(=O)-[#7]` — amide bond
   - `[OH]` — any hydroxyl group
   - `[n;H1]` — NH in an aromatic ring
   - `[F,Cl,Br,I]` — any halogen
-- Matching substructures are **highlighted in orange** on each hit thumbnail
-- No threshold or fingerprint settings apply — all matches are returned
+- Matching atoms are **highlighted** on each thumbnail
 - Runs on CPU using RDKit; can be cancelled with the Stop button
+
+---
+
+## Clustering
+After a search, a **Cluster** toolbar appears above the results table.
+
+- Set **Min similarity** (0.10–0.90): molecules with Tanimoto ≥ this value are placed in the same cluster
+  - Higher value → more clusters, smaller and tighter groups
+  - Lower value → fewer clusters, larger and looser groups
+- Click **Apply Clustering** — results are instantly re-grouped without repeating the search
+- The **Cluster** column appears and results are sorted by cluster ID, then by score within each cluster
+- Click **Clear** to remove cluster assignments
+- Clustering always uses **Morgan ECFP4** fingerprints (radius 2, 2048 bits), which give the most
+  chemically meaningful groupings regardless of which fingerprint was used for the search
 
 ---
 
@@ -2105,47 +2313,56 @@ Finds all molecules containing your query as a substructure.
 ## Fingerprint Types
 | Name | Description |
 |------|-------------|
-| Morgan/ECFP4 | Circular fingerprint, radius 2, 2048 bits — **most common for drug-like molecules** |
-| Morgan/ECFP6 | Circular fingerprint, radius 3, 2048 bits — captures larger neighbourhoods |
+| Morgan/ECFP4 | Circular fingerprint, radius 2, 2048 bits — **recommended for most use cases** |
+| Morgan/ECFP6 | Circular fingerprint, radius 3, 2048 bits — captures larger chemical neighbourhoods |
 | Morgan/FCFP4 | Feature-based circular, radius 2 — pharmacophore-aware |
 | RDKit Topological | Path-based topological fingerprint |
-| MACCS Keys | 166-bit key-based fingerprint — fast, interpretable |
-| Atom Pairs | Counts atom pair types at varying distances |
-| Topological Torsion | Encodes torsion angles around rotatable bonds |
+| MACCS Keys | 166-bit predefined key fingerprint — fast and interpretable |
+| Atom Pairs | Encodes atom-pair types at varying graph distances |
+| Topological Torsion | Encodes four-atom torsion paths |
+
+The fingerprint type is fixed when a database is built and auto-selected on load.
 
 ---
 
 ## Performance
 - FPSim2 searches **millions of molecules in < 1 second** on CPU (multi-threaded)
-- GPU mode (CUDA) gives an additional **5–50× speedup** for large databases
+- GPU mode (CUDA/Tanimoto) gives an additional **5–50× speedup** for large databases
 - The `.h5` database is memory-mapped — loading is near-instantaneous
+- Clustering runs on the result set only, not the database — it is always fast
 
 ---
 
 ## Structure Editor (Ketcher)
-Click **Draw Structure** in the query panel to open [Ketcher](https://github.com/epam/ketcher)
-(MIT) in your browser. Draw or paste a structure, then click **Use this structure** — the SMILES
+Click **Draw Structure** to open [Ketcher](https://github.com/epam/ketcher) (MIT, EPAM)
+in your browser. Draw or paste a structure, then click **Use this structure** — the SMILES
 is sent back to MolDigger automatically.
 
-- You can modify the structure and submit again without restarting
 - Ketcher serves on a fixed local port (18920)
-- SMILES and SMARTS can also be typed directly into the query field without opening Ketcher
+- SMILES and SMARTS can also be typed directly into the query field
+
+---
 
 ## Results Table
-- Right-click any row for options: **Copy SMILES** or **Use as Query**
-- "Use as Query" loads the hit's SMILES directly into the search field for a new search
+- Columns: **#** · **Cluster** (when clustering active) · **Name** · **Structure** · **Score** · **MW** · **ClogP** · **SMILES**
+- Click any column header to sort
+- Right-click any row: **Copy SMILES** or **Use as Query**
+- **Export CSV** saves all visible columns (except the structure image)
 
 ---
 
 ## Full Install
 ```
-pip install rdkit fpsim2 PyQt5 numpy tables pandas
-pip install cupy-cuda12x   # for GPU — match your CUDA version
+conda create -n moldigger python=3.11
+conda activate moldigger
+conda install -c conda-forge rdkit
+pip install fpsim2 PyQt5 numpy tables
+pip install cupy-cuda12x   # optional GPU support — match your CUDA version
 ```
 
 ## License
-This tool is MIT licensed.  Core dependencies:
-- [FPSim2](https://github.com/chembl/FPSim2) — MIT  (ChEMBL)
+MIT.  Core dependencies:
+- [FPSim2](https://github.com/chembl/FPSim2) — MIT (ChEMBL)
 - [RDKit](https://github.com/rdkit/rdkit) — BSD-3-Clause
 - [PyQt5](https://riverbankcomputing.com/software/pyqt/) — GPL v3 / commercial
 - [PyTables](https://www.pytables.org/) — BSD
@@ -2160,7 +2377,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MolDigger — Ultrafast Molecular Structure Search")
+        self.setWindowTitle("MolDigger — Ultrafast Molecular Structure Searching & Clustering")
         self.setMinimumSize(1200, 760)
         self._build_ui()
         self._warn_missing_deps()

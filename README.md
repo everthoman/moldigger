@@ -1,8 +1,6 @@
-# MolDigger
+# MolDigger — Ultrafast Molecular Structure Searching & Clustering
 
-**Ultrafast molecular structure search with a PyQt5 GUI**
-
-MolDigger is a desktop application for searching large chemical databases by molecular similarity or substructure. It uses [FPSim2](https://github.com/chembl/FPSim2) for fingerprint-based similarity search (capable of screening millions of compounds in milliseconds) and [RDKit](https://www.rdkit.org/) for substructure matching, 2D depiction, and property calculation.
+MolDigger is a molecular structure search and clustering tool available as both a **PyQt5 desktop app** and a **browser-based web app**. It uses [FPSim2](https://github.com/chembl/FPSim2) for fingerprint-based similarity search (screening millions of compounds in milliseconds) and [RDKit](https://www.rdkit.org/) for substructure matching, Butina clustering, 2D depiction, and property calculation.
 
 ![MolDigger screenshot](screenshot.png)
 
@@ -10,18 +8,43 @@ MolDigger is a desktop application for searching large chemical databases by mol
 
 ## Features
 
-- **Similarity search** — Tanimoto, Dice, and Tversky metrics with adjustable threshold
+- **Similarity search** — Tanimoto, Dice, and Tversky metrics with adjustable min/max threshold range
 - **Substructure search** — SMILES or SMARTS queries with multi-threaded RDKit matching
+- **Clustering** — Butina clustering of search results with adjustable similarity cutoff; cluster ID column added to results table; always uses Morgan ECFP4 for best chemical groupings
+- **Atom highlighting** — MCS highlighted in similarity hits; matched atoms highlighted in substructure hits (optional, uses RDKit default highlight colour)
 - **GPU acceleration** — NVIDIA CUDA via FPSim2's CudaEngine (Tanimoto only)
 - **Multiple fingerprint types** — Morgan/ECFP4, ECFP6, FCFP4, RDKit Topological, MACCS Keys, Atom Pairs, Topological Torsion
 - **Auto-detects fingerprint type** from the loaded database file
-- **MCS highlighting** — maximum common substructure highlighted in hit thumbnails (similarity search)
-- **Substructure highlighting** — matched atoms highlighted in orange (substructure search)
 - **Structure editor** — [Ketcher](https://github.com/epam/ketcher) launched in browser; drawn structures sent back to the app automatically
 - **Results table** — sortable, with 2D thumbnails, MW, ClogP; right-click to copy SMILES or use hit as new query
 - **Stop button** — cancel any running search mid-way
 - **Database builder** — create FPSim2 `.h5` databases from SDF or SMILES files within the app
 - **Export** — save results to CSV
+
+---
+
+## Apps
+
+### Desktop app — `moldigger.py`
+
+Full-featured PyQt5 GUI. Run with:
+
+```bash
+conda activate moldigger
+python moldigger.py
+```
+
+### Web app — `moldigger_web.py`
+
+Browser-based interface built with FastAPI and uvicorn. Useful on headless servers or when a native GUI is not available.
+
+```bash
+conda activate moldigger
+python moldigger_web.py
+# opens http://localhost:8000 in your browser
+```
+
+Both apps share the same database format and support the same search, clustering, and highlighting features.
 
 ---
 
@@ -41,6 +64,12 @@ conda install -c conda-forge rdkit
 pip install fpsim2 PyQt5 numpy tables
 ```
 
+### Web app only (no GUI dependencies needed)
+
+```bash
+pip install fastapi uvicorn
+```
+
 ### GPU support (optional)
 
 Requires an NVIDIA GPU with CUDA installed. Match the `cupy` version to your CUDA installation:
@@ -57,16 +86,12 @@ GPU availability is detected automatically at startup. If available, a **Use GPU
 
 ## Quick Start
 
-```bash
-conda activate moldigger
-python moldigger.py
-```
-
 1. **Database tab** → load an existing `.h5` file, or build one from an SDF/SMILES file
 2. **Structure Search tab** → type a SMILES or SMARTS query (live 2D preview updates as you type)
-3. Choose **Search type** (Similarity or Substructure), fingerprint, metric, and threshold
-4. Click **Search**
-5. Click **Search** again while running to **stop** it
+3. Choose **Search type** (Similarity or Substructure), fingerprint, metric, and threshold range
+4. Click **Search** — results appear sorted by score with 2D thumbnails
+5. Optionally click **Apply Clustering** above the results table to group hits by structural similarity
+6. Click **Search** again while running to **stop** it
 
 ---
 
@@ -93,7 +118,7 @@ Finds molecules with similar fingerprints to the query using a chosen metric:
 | **Dice** | `2|A∩B| / (|A|+|B|)` — gives higher scores than Tanimoto |
 | **Tversky** | Asymmetric; α=1, β=0 finds larger molecules containing your scaffold |
 
-Set the threshold slider to control the minimum score returned. Results are colour-coded green (score = 1.00) → yellow → orange → red (low similarity).
+Set the **Min** and **Max** threshold sliders to control the score range returned. Results are colour-coded green (score = 1.00) → yellow → orange → red (low similarity). The MCS (maximum common substructure) between the query and each hit is highlighted in the 2D thumbnail.
 
 ### Substructure Search
 
@@ -105,7 +130,21 @@ Finds all molecules containing the query as a substructure. Accepts:
   - `[F,Cl,Br,I]` — any halogen
   - `[n;H1]` — NH in an aromatic ring
 
-Matched atoms are highlighted in orange in the hit thumbnails. Runs on CPU using all configured worker threads.
+Matched atoms are highlighted in the hit thumbnails. Runs on CPU using all configured worker threads.
+
+---
+
+## Clustering
+
+After a search, a **Cluster** toolbar appears above the results table. Clustering is decoupled from search — you can adjust the cutoff and re-cluster without repeating the database search:
+
+1. Set **Min similarity** (0.10–0.90, default 0.40) — molecules with ≥ this similarity will tend to be grouped together
+2. Click **Apply Clustering** — a **Cluster** column appears and results are sorted by cluster ID
+3. Click **Clear** to remove clustering and restore score order
+
+Clustering always uses **Morgan ECFP4** fingerprints (radius=2, 2048 bits) regardless of the fingerprint type used for the similarity search, as Morgan ECFP4 gives the best chemical groupings for diverse compound sets.
+
+The underlying algorithm is Butina clustering (`rdkit.ML.Cluster.Butina`), which is a standard single-pass, sphere-exclusion method widely used in cheminformatics.
 
 ---
 
@@ -148,8 +187,10 @@ MolDigger integrates [Ketcher](https://github.com/epam/ketcher) (MIT) as a struc
 | Package | Purpose | License |
 |---------|---------|---------|
 | [FPSim2](https://github.com/chembl/FPSim2) | Fingerprint similarity search | MIT |
-| [RDKit](https://www.rdkit.org/) | Cheminformatics, substructure search, depiction | BSD-3-Clause |
-| [PyQt5](https://riverbankcomputing.com/software/pyqt/) | GUI framework | GPL v3 / commercial |
+| [RDKit](https://www.rdkit.org/) | Cheminformatics, substructure search, clustering, depiction | BSD-3-Clause |
+| [PyQt5](https://riverbankcomputing.com/software/pyqt/) | Desktop GUI framework | GPL v3 / commercial |
+| [FastAPI](https://fastapi.tiangolo.com/) | Web app framework | MIT |
+| [uvicorn](https://www.uvicorn.org/) | ASGI server for web app | BSD |
 | [PyTables](https://www.pytables.org/) | HDF5 I/O | BSD |
 | [NumPy](https://numpy.org/) | Array operations | BSD |
 | [CuPy](https://cupy.dev/) *(optional)* | GPU array library for CUDA | MIT |
