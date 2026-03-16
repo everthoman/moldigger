@@ -2,7 +2,7 @@
 
 MolDigger is a molecular structure search and clustering tool available as both a **PyQt5 desktop app** and a **browser-based web app**. It uses [FPSim2](https://github.com/chembl/FPSim2) for fingerprint-based similarity search (screening millions of compounds in milliseconds) and [RDKit](https://www.rdkit.org/) for substructure matching, Butina clustering, 2D depiction, and property calculation.
 
-![MolDigger screenshot](screenshot.png)
+![MolDigger screenshot](moldigger.png)
 
 ---
 
