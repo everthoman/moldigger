@@ -6,7 +6,11 @@ Flask web server version of the MolDigger desktop app.
 Uses FPSim2 for similarity search and RDKit for substructure search.
 
 Usage:
-    python moldigger_web.py [--host 127.0.0.1] [--port 5000] [--debug]
+    python moldigger_web.py [--host 0.0.0.0] [--port 8000] [--reload]
+
+    By default the server binds to all interfaces (0.0.0.0). To restrict to a
+    specific IP or interface, pass --host, e.g.:
+        python moldigger_web.py --host 192.168.1.10
 """
 
 import sys
@@ -1266,6 +1270,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <span class="pill err" id="pill-fpsim2">FPSim2</span>
     <span class="pill warn" id="pill-gpu">GPU</span>
   </div>
+  <button class="btn btn-ghost btn-sm" onclick="document.getElementById('help-modal').classList.add('open')" style="margin-left:auto;">? Help</button>
 </header>
 
 <!-- Layout -->
@@ -1529,6 +1534,88 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </div>
     <div class="modal-body">
       <iframe id="ketcher-frame" src="/ketcher/" title="Ketcher structure editor"></iframe>
+    </div>
+  </div>
+</div>
+
+<!-- Help modal -->
+<div class="modal-overlay" id="help-modal" onclick="if(event.target===this)this.classList.remove('open')">
+  <div class="modal" style="max-width:700px;">
+    <div class="modal-header">
+      <span class="modal-title">MolDigger — Help</span>
+      <button class="btn btn-ghost btn-sm" onclick="document.getElementById('help-modal').classList.remove('open')">Close</button>
+    </div>
+    <div class="modal-body" style="overflow-y:auto; max-height:70vh; padding:1.2rem 1.5rem; line-height:1.6;">
+
+<h3>Quick Start</h3>
+<ol>
+  <li><strong>Database</strong> → load an existing <code>.h5</code> file, or build one from an SDF/SMILES file</li>
+  <li><strong>Query</strong> → type a SMILES or SMARTS string (live 2D preview updates as you type), or click <strong>Draw Structure</strong> to use Ketcher</li>
+  <li>Choose <strong>Similarity</strong> or <strong>Substructure</strong> search and set parameters</li>
+  <li>Click <strong>Search</strong> — results appear sorted by score with 2D thumbnails; click again to stop</li>
+  <li>Optionally click <strong>Apply Clustering</strong> above the results to group hits by structural similarity</li>
+</ol>
+
+<hr>
+
+<h3>Search Types</h3>
+<h4>Similarity</h4>
+<p>Finds molecules with similar fingerprints to your query using a chosen metric:</p>
+<table style="width:100%; border-collapse:collapse; font-size:0.9em;">
+  <tr><th style="text-align:left; padding:4px 8px; border-bottom:1px solid #ddd;">Metric</th><th style="text-align:left; padding:4px 8px; border-bottom:1px solid #ddd;">Description</th></tr>
+  <tr><td style="padding:4px 8px;"><strong>Tanimoto</strong></td><td style="padding:4px 8px;">Standard Jaccard similarity — most common in cheminformatics</td></tr>
+  <tr><td style="padding:4px 8px;"><strong>Dice</strong></td><td style="padding:4px 8px;">2·|A∩B| / (|A|+|B|) — gives higher scores than Tanimoto</td></tr>
+  <tr><td style="padding:4px 8px;"><strong>Tversky</strong></td><td style="padding:4px 8px;">Asymmetric; α=1, β=0 finds larger molecules containing your scaffold</td></tr>
+</table>
+<p>Set <strong>Min / Max</strong> threshold to control the score range. Results are colour-coded green (high) → red (low). The MCS between the query and each hit is highlighted.</p>
+
+<h4>Substructure</h4>
+<p>Finds all molecules containing the query as a substructure. Accepts SMILES or SMARTS:</p>
+<ul>
+  <li><code>c1ccccc1</code> — any benzene ring</li>
+  <li><code>[#6]-C(=O)-[#7]</code> — amide bond</li>
+  <li><code>[F,Cl,Br,I]</code> — any halogen</li>
+  <li><code>[n;H1]</code> — NH in an aromatic ring</li>
+</ul>
+
+<hr>
+
+<h3>Clustering</h3>
+<p>After a search, click <strong>Apply Clustering</strong>. Adjust <strong>Min similarity</strong> and re-cluster without repeating the search. Always uses Morgan ECFP4 (best chemical groupings). Click <strong>Clear</strong> to restore score order.</p>
+
+<hr>
+
+<h3>Fingerprint Types</h3>
+<table style="width:100%; border-collapse:collapse; font-size:0.9em;">
+  <tr><th style="text-align:left; padding:4px 8px; border-bottom:1px solid #ddd;">Name</th><th style="text-align:left; padding:4px 8px; border-bottom:1px solid #ddd;">Notes</th></tr>
+  <tr><td style="padding:4px 8px;">Morgan / ECFP4</td><td style="padding:4px 8px;">Most common for drug-like molecules — recommended</td></tr>
+  <tr><td style="padding:4px 8px;">Morgan / ECFP6</td><td style="padding:4px 8px;">Larger neighbourhood</td></tr>
+  <tr><td style="padding:4px 8px;">Morgan / FCFP4</td><td style="padding:4px 8px;">Feature-based, pharmacophore-aware</td></tr>
+  <tr><td style="padding:4px 8px;">RDKit Topological</td><td style="padding:4px 8px;">Path-based</td></tr>
+  <tr><td style="padding:4px 8px;">MACCS Keys</td><td style="padding:4px 8px;">166-bit, interpretable</td></tr>
+  <tr><td style="padding:4px 8px;">Atom Pairs</td><td style="padding:4px 8px;">Encodes atom-pair types</td></tr>
+  <tr><td style="padding:4px 8px;">Topological Torsion</td><td style="padding:4px 8px;">Encodes torsion angles</td></tr>
+</table>
+<p>The fingerprint type is fixed at database build time and auto-detected on load.</p>
+
+<hr>
+
+<h3>Results Table</h3>
+<p>Columns: <strong>#</strong> · <strong>Cluster</strong> (when active) · <strong>Name</strong> · <strong>Structure</strong> · <strong>Score</strong> · <strong>MW</strong> · <strong>ClogP</strong> · <strong>SMILES</strong>. Click any column header to sort. <strong>Export CSV</strong> saves all columns.</p>
+
+<hr>
+
+<h3>Installation</h3>
+<pre style="background:#f4f4f4; padding:0.8rem; border-radius:4px; font-size:0.85em; overflow-x:auto;">conda create -n moldigger python=3.11
+conda activate moldigger
+conda install -c conda-forge rdkit
+pip install fpsim2 fastapi uvicorn numpy tables
+pip install cupy-cuda12x   # optional GPU (match your CUDA version)</pre>
+<p>Run the web app:</p>
+<pre style="background:#f4f4f4; padding:0.8rem; border-radius:4px; font-size:0.85em; overflow-x:auto;">python moldigger_web.py                       # binds to 0.0.0.0:8000
+python moldigger_web.py --host 192.168.1.10   # specific interface
+python moldigger_web.py --port 9000           # custom port</pre>
+
     </div>
   </div>
 </div>
@@ -2225,7 +2312,9 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="MolDigger Web — Browser-based molecular search")
-    parser.add_argument("--host", default="172.21.65.193", help="Bind host (default: 172.21.65.193)")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="Bind address (default: 0.0.0.0 — all interfaces). "
+                             "Pass a specific IP to restrict access, e.g. --host 192.168.1.10")
     parser.add_argument("--port", type=int, default=8000, help="Port (default: 8000)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload on code changes")
     args = parser.parse_args()
@@ -2237,9 +2326,13 @@ if __name__ == "__main__":
     if GPU_OK:
         log.info("CUDA GPU support available.")
     if not (KETCHER_DIR / "index.html").exists():
-        log.info("Ketcher not found — draw button disabled. Run the desktop app once to install it.")
+        log.info("Ketcher not found — draw button disabled. "
+                 "Download ketcher-standalone from https://github.com/epam/ketcher/releases "
+                 "and extract to ~/.moldigger/ketcher/")
 
-    log.info(f"Starting MolDigger Web at http://{args.host}:{args.port}")
+    import socket
+    display_host = socket.getfqdn() if args.host in ("0.0.0.0", "::") else args.host
+    log.info(f"Starting MolDigger Web at http://{display_host}:{args.port}")
     uvicorn.run(
         "moldigger_web:app" if args.reload else app,
         host=args.host,
