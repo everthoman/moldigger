@@ -392,7 +392,32 @@ def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None,
 
 LISTS_DIR = Path.home() / ".moldigger"
 LISTS_PATH = LISTS_DIR / "lists.json"
+STATE_PATH = LISTS_DIR / "state.json"
 _lists_lock = threading.Lock()
+
+
+def _persist_last_db_path(path: str) -> None:
+    """Remember the most recently loaded DB path so we can restore on startup."""
+    try:
+        LISTS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"last_db_path": str(Path(path).resolve())}, fh)
+        os.replace(tmp, STATE_PATH)
+    except Exception as exc:
+        log.warning(f"Could not persist last_db_path: {exc}")
+
+
+def _read_last_db_path() -> str | None:
+    if not STATE_PATH.exists():
+        return None
+    try:
+        with open(STATE_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        p = data.get("last_db_path")
+        return p if p and Path(p).exists() else None
+    except Exception:
+        return None
 
 
 def _lists_load_all() -> dict:
@@ -894,68 +919,98 @@ def api_status():
         }
 
 
+def _perform_load_db(path: str) -> dict:
+    """Load a DB into _state, including substructure cache. Returns result dict
+    on success or raises. Used by both the /api/load_db endpoint and the
+    startup auto-loader.
+    """
+    path = os.path.expanduser((path or "").strip())
+    if not path:
+        raise ValueError("path is required")
+    if not Path(path).exists():
+        raise FileNotFoundError(f"File not found: {path}")
+    if not FPSIM2_OK:
+        raise RuntimeError("FPSim2 is not installed")
+
+    engine = FPSim2Engine(path)
+    companion = path + ".smiles.json"
+    mol_map = {}
+    if Path(companion).exists():
+        with open(companion, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        mol_map = {str(k): v for k, v in raw.items()}
+
+    fp_name = _fp_name_from_engine(engine)
+
+    sub_cache_source = "disk"
+    sub_cache_bytes = 0
+    t0 = time.perf_counter()
+    cached = _load_substructure_cache(path)
+    if cached is not None:
+        sub_ids, sub_mols, sub_patt_fps = cached
+    else:
+        sub_cache_source = "build"
+        sub_ids, sub_mols, sub_patt_fps = _build_substructure_cache(mol_map)
+        sub_cache_bytes = _save_substructure_cache(path, sub_ids, sub_mols, sub_patt_fps)
+    sub_build_s = time.perf_counter() - t0
+    log.info(
+        f"Substructure cache: {len(sub_mols):,}/{len(mol_map):,} mols "
+        f"({sub_cache_source}) in {sub_build_s:.1f}s"
+        + (f", saved {sub_cache_bytes / 1e6:.1f} MB" if sub_cache_bytes else "")
+    )
+
+    with _state_lock:
+        _state["engine"] = engine
+        _state["mol_map"] = mol_map
+        _state["db_path"] = path
+        _state["fp_name"] = fp_name
+        _state["mol_count"] = len(mol_map)
+        _state["sub_ids"] = sub_ids
+        _state["sub_mols"] = sub_mols
+        _state["sub_patt_fps"] = sub_patt_fps
+
+    _persist_last_db_path(path)
+
+    return {
+        "ok": True,
+        "mol_count": len(mol_map),
+        "fp_name": fp_name,
+        "path": path,
+        "sub_cache_count": len(sub_mols),
+        "sub_cache_build_s": round(sub_build_s, 2),
+        "sub_cache_source": sub_cache_source,
+    }
+
+
 @app.post("/api/load_db")
 def api_load_db(req: LoadDbRequest):
-    path = os.path.expanduser(req.path.strip())
-    if not path:
-        return JSONResponse({"error": "path is required"}, status_code=400)
-    if not Path(path).exists():
-        return JSONResponse({"error": f"File not found: {path}"}, status_code=404)
-    if not FPSIM2_OK:
-        return JSONResponse({"error": "FPSim2 is not installed"}, status_code=500)
-
     try:
-        engine = FPSim2Engine(path)
-        companion = path + ".smiles.json"
-        mol_map = {}
-        if Path(companion).exists():
-            with open(companion, encoding="utf-8") as fh:
-                raw = json.load(fh)
-            mol_map = {str(k): v for k, v in raw.items()}
-
-        fp_name = _fp_name_from_engine(engine)
-
-        # Substructure cache (parsed Mols + pattern fingerprints).
-        # Try disk first; fall back to a fresh build and persist on success.
-        sub_cache_source = "disk"
-        sub_cache_bytes = 0
-        t0 = time.perf_counter()
-        cached = _load_substructure_cache(path)
-        if cached is not None:
-            sub_ids, sub_mols, sub_patt_fps = cached
-        else:
-            sub_cache_source = "build"
-            sub_ids, sub_mols, sub_patt_fps = _build_substructure_cache(mol_map)
-            sub_cache_bytes = _save_substructure_cache(path, sub_ids, sub_mols, sub_patt_fps)
-        sub_build_s = time.perf_counter() - t0
-        log.info(
-            f"Substructure cache: {len(sub_mols):,}/{len(mol_map):,} mols "
-            f"({sub_cache_source}) in {sub_build_s:.1f}s"
-            + (f", saved {sub_cache_bytes / 1e6:.1f} MB" if sub_cache_bytes else "")
-        )
-
-        with _state_lock:
-            _state["engine"] = engine
-            _state["mol_map"] = mol_map
-            _state["db_path"] = path
-            _state["fp_name"] = fp_name
-            _state["mol_count"] = len(mol_map)
-            _state["sub_ids"] = sub_ids
-            _state["sub_mols"] = sub_mols
-            _state["sub_patt_fps"] = sub_patt_fps
-
-        return {
-            "ok": True,
-            "mol_count": len(mol_map),
-            "fp_name": fp_name,
-            "path": path,
-            "sub_cache_count": len(sub_mols),
-            "sub_cache_build_s": round(sub_build_s, 2),
-            "sub_cache_source": sub_cache_source,
-        }
+        return _perform_load_db(req.path)
+    except FileNotFoundError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except (ValueError, RuntimeError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     except Exception as exc:
         log.exception("load_db failed")
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.on_event("startup")
+def _autoload_last_db():
+    """If a DB was loaded in a previous run, restore it in a background thread."""
+    last = _read_last_db_path()
+    if not last:
+        return
+
+    def _do():
+        try:
+            log.info(f"Auto-loading last DB: {last}")
+            _perform_load_db(last)
+            log.info("Auto-load complete.")
+        except Exception as exc:
+            log.warning(f"Auto-load failed for {last}: {exc}")
+
+    threading.Thread(target=_do, daemon=True).start()
 
 
 @app.post("/api/search")
@@ -2735,10 +2790,12 @@ function refreshLists() {
       }
       savedEl.innerHTML = names.map(function(name) {
         const meta = lists[name];
-        return '<div style="display:flex; justify-content:space-between; align-items:center; padding:3px 4px; font-size:13px; border-bottom:1px solid var(--border);">'
-          + '<span style="cursor:pointer;" title="Load this list as results" onclick="loadList(' + JSON.stringify(name).replace(/"/g, '&quot;') + ')">'
+        const nameArg = JSON.stringify(name).replace(/"/g, '&quot;');
+        return '<div style="display:flex; justify-content:space-between; align-items:center; gap:6px; padding:3px 4px; font-size:13px; border-bottom:1px solid var(--border);">'
+          + '<span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="' + escHtml(name) + '">'
           + escHtml(name) + ' <span style="color:var(--text-muted); font-size:11px;">(' + meta.count.toLocaleString() + ')</span></span>'
-          + '<button class="action-btn" onclick="deleteList(' + JSON.stringify(name).replace(/"/g, '&quot;') + ')" title="Delete">✕</button>'
+          + '<button class="btn btn-ghost btn-sm" style="padding:1px 8px; font-size:11px;" onclick="loadList(' + nameArg + ')" title="Load this list as results">Load</button>'
+          + '<button class="action-btn" onclick="deleteList(' + nameArg + ')" title="Delete">✕</button>'
           + '</div>';
       }).join('');
       sel.innerHTML = names.map(function(name) {
@@ -2830,11 +2887,17 @@ function importListFromSmiles() {
 function deleteList(name) {
   if (!confirm('Delete list "' + name + '"?')) return;
   fetch('/api/lists/' + encodeURIComponent(name), {method: 'DELETE'})
-    .then(function(r) { return r.json(); })
+    .then(function(r) {
+      if (!r.ok && r.status !== 404) {
+        return r.text().then(function(t) { throw new Error('HTTP ' + r.status + ': ' + t); });
+      }
+      return r.json();
+    })
     .then(function(d) {
-      if (d.error) alert(d.error);
+      if (d.error) alert('Delete failed: ' + d.error);
       else refreshLists();
-    });
+    })
+    .catch(function(e) { alert('Delete failed: ' + e.message); });
 }
 
 function loadList(name) {
