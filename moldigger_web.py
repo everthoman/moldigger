@@ -2014,7 +2014,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             <th class="cluster-col" style="display:none;" onclick="sortTable('cluster_id')" title="Butina cluster ID">Cluster</th>
             <th class="sortable" onclick="sortTable('name')">Name <span class="sort-icon"></span></th>
             <th>Structure</th>
-            <th class="sortable" id="score-header" onclick="sortTable('score')">Score <span class="sort-icon"></span></th>
+            <th class="sortable score-col" id="score-header" onclick="sortTable('score')">Score <span class="sort-icon"></span></th>
             <th class="sortable" onclick="sortTable('mw')">MW <span class="sort-icon"></span></th>
             <th class="sortable" onclick="sortTable('clogp')">ClogP <span class="sort-icon"></span></th>
             <th>SMILES</th>
@@ -2534,6 +2534,10 @@ function renderResults(data) {
   const clusterDisplay = hasClusters ? '' : 'none';
   document.querySelectorAll('.cluster-col').forEach(el => el.style.display = clusterDisplay);
 
+  // Hide score column for list results (no meaningful score per row)
+  const scoreColDisplay = (currentSearchType === 'list') ? 'none' : '';
+  document.querySelectorAll('.score-col').forEach(el => el.style.display = scoreColDisplay);
+
   document.getElementById('placeholder').style.display = 'none';
   document.getElementById('results-header').style.display = 'flex';
   document.getElementById('cluster-bar').style.display = currentResults.length > 0 ? 'flex' : 'none';
@@ -2591,11 +2595,10 @@ function _renderTable() {
     let scoreHtml;
     if (isSub) {
       scoreHtml = '<span class="score-cell score-sub">match</span>';
-    } else if (currentSearchType === 'list') {
-      scoreHtml = '<span class="score-cell score-sub">list</span>';
     } else {
       scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(2) + '</span>';
     }
+    const scoreCellDisplay = (currentSearchType === 'list') ? 'none' : '';
 
     const clusterDisplay = (row.cluster_id !== null && row.cluster_id !== undefined) ? '' : 'none';
     const checked = selectedMolIds.has(row.mol_id) ? ' checked' : '';
@@ -2605,7 +2608,7 @@ function _renderTable() {
       '<td class="cluster-col prop-cell" style="display:' + clusterDisplay + ';">' + (row.cluster_id !== null && row.cluster_id !== undefined ? row.cluster_id : '') + '</td>' +
       '<td class="name-cell" title="' + escHtml(row.name || '') + '">' + escHtml(truncate(row.name || '', 24)) + '</td>' +
       '<td class="struct-cell">' + (row.svg || '') + '</td>' +
-      '<td>' + scoreHtml + '</td>' +
+      '<td class="score-col" style="display:' + scoreCellDisplay + ';">' + scoreHtml + '</td>' +
       '<td class="prop-cell">' + (row.mw !== null && row.mw !== undefined ? row.mw.toFixed(1) : '—') + '</td>' +
       '<td class="prop-cell">' + (row.clogp !== null && row.clogp !== undefined ? row.clogp.toFixed(2) : '—') + '</td>' +
       '<td>' +
