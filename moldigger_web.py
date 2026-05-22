@@ -2522,8 +2522,10 @@ function renderResults(data) {
   selectedMolIds = new Set();  // fresh result set ⇒ clear selection
   _updateSelectionInfo();
   const total = data.total || 0;
-  const metricLabel = currentSearchType === 'substructure' ? 'Substructure'
-    : (document.getElementById('metric-select').options[document.getElementById('metric-select').selectedIndex].text);
+  let metricLabel;
+  if (currentSearchType === 'substructure') metricLabel = 'Substructure';
+  else if (currentSearchType === 'list') metricLabel = 'List';
+  else metricLabel = document.getElementById('metric-select').options[document.getElementById('metric-select').selectedIndex].text;
   const scoreHeader = document.getElementById('score-header');
   if (scoreHeader) scoreHeader.childNodes[0].textContent = metricLabel + ' ';
 
@@ -2589,6 +2591,8 @@ function _renderTable() {
     let scoreHtml;
     if (isSub) {
       scoreHtml = '<span class="score-cell score-sub">match</span>';
+    } else if (currentSearchType === 'list') {
+      scoreHtml = '<span class="score-cell score-sub">list</span>';
     } else {
       scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(2) + '</span>';
     }
