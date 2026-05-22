@@ -120,6 +120,13 @@ _state = {
     "db_path": None,
     "fp_name": None,
     "mol_count": 0,
+    # Substructure-search cache (parallel arrays, built eagerly at load):
+    #   sub_ids[i]      -> mol_id key into mol_map
+    #   sub_mols[i]     -> rdkit.Chem.Mol (parsed once)
+    #   sub_patt_fps[i] -> ExplicitBitVect (PatternFingerprint, pre-screen)
+    "sub_ids": [],
+    "sub_mols": [],
+    "sub_patt_fps": [],
 }
 
 _jobs = {}
@@ -369,6 +376,40 @@ def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None,
         })
     return rows
 
+# ── Substructure cache ────────────────────────────────────────────────────────
+
+def _build_substructure_cache(mol_map: dict, progress_cb=None):
+    """Parse each db SMILES once and compute a PatternFingerprint for screening.
+
+    Returns (ids, mols, patt_fps) as parallel lists. Entries that fail to parse
+    are dropped. Safe to call without RDKit (returns empty lists).
+    """
+    if not RDKIT_OK or not mol_map:
+        return [], [], []
+    ids, mols, fps = [], [], []
+    total = len(mol_map)
+    step = max(1, total // 20)
+    for i, (mid, entry) in enumerate(mol_map.items()):
+        smi = entry.get("smiles", "") if isinstance(entry, dict) else str(entry)
+        if not smi:
+            continue
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        try:
+            fp = Chem.PatternFingerprint(mol)
+        except Exception:
+            continue
+        ids.append(mid)
+        mols.append(mol)
+        fps.append(fp)
+        if progress_cb is not None and (i % step == 0):
+            progress_cb(i + 1, total)
+    if progress_cb is not None:
+        progress_cb(total, total)
+    return ids, mols, fps
+
+
 # ── Search runners ────────────────────────────────────────────────────────────
 
 def _run_similarity_search(jid: str, smiles: str, threshold: float, threshold_max: float,
@@ -431,6 +472,9 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
         update_job_progress(jid, "Starting substructure search…")
         with _state_lock:
             mol_map = dict(_state["mol_map"])
+            sub_ids = _state["sub_ids"]
+            sub_mols = _state["sub_mols"]
+            sub_patt_fps = _state["sub_patt_fps"]
 
         if not mol_map:
             finish_job(jid, error="No database loaded.")
@@ -440,43 +484,45 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
             finish_job(jid, error="RDKit not available for substructure search.")
             return
 
+        if not sub_mols:
+            finish_job(jid, error="Substructure cache not built. Reload the database.")
+            return
+
+        q = Chem.MolFromSmarts(query)
+        if q is None:
+            q = Chem.MolFromSmiles(query)
+        if q is None:
+            finish_job(jid, error="Could not parse query as SMARTS or SMILES.")
+            return
+
+        try:
+            q_fp = Chem.PatternFingerprint(q)
+        except Exception:
+            q_fp = None
+
         t0 = time.perf_counter()
-        update_job_progress(jid, f"Searching {len(mol_map):,} molecules…")
-
-        items = list(mol_map.items())
-
-        def match_chunk(chunk):
-            q = Chem.MolFromSmarts(query)
-            if q is None:
-                q = Chem.MolFromSmiles(query)
-            local_results = []
-            local_atoms = {}
-            for mol_id, entry in chunk:
-                smiles = entry.get("smiles", "") if isinstance(entry, dict) else str(entry)
-                if not smiles:
-                    continue
-                mol = Chem.MolFromSmiles(smiles)
-                if mol is None:
-                    continue
-                match = mol.GetSubstructMatch(q)
-                if match:
-                    local_results.append((mol_id, 1.0))
-                    local_atoms[mol_id] = list(match)
-            return local_results, local_atoms
-
-        n = max(1, n_workers)
-        chunk_size = max(1, (len(items) + n - 1) // n)
-        chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+        update_job_progress(jid, f"Searching {len(sub_mols):,} molecules…")
 
         all_results = []
         match_atoms = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
-            for local_results, local_atoms in pool.map(match_chunk, chunks):
-                all_results.extend(local_results)
-                match_atoms.update(local_atoms)
+        screened = 0
+        for mid, mol, fp in zip(sub_ids, sub_mols, sub_patt_fps):
+            # Pattern-FP superset pre-screen: q_fp bits must be a subset of mol fp.
+            if q_fp is not None:
+                if (q_fp & fp) != q_fp:
+                    continue
+            screened += 1
+            match = mol.GetSubstructMatch(q)
+            if match:
+                all_results.append((mid, 1.0))
+                match_atoms[mid] = list(match)
 
         elapsed = time.perf_counter() - t0
-        update_job_progress(jid, f"Found {len(all_results):,} hits in {elapsed:.3f}s, building results…")
+        update_job_progress(
+            jid,
+            f"Found {len(all_results):,} hits in {elapsed:.3f}s "
+            f"({screened:,}/{len(sub_mols):,} survived FP screen), building results…",
+        )
 
         hits = all_results
         if max_results > 0:
@@ -648,14 +694,33 @@ def api_load_db(req: LoadDbRequest):
             mol_map = {str(k): v for k, v in raw.items()}
 
         fp_name = _fp_name_from_engine(engine)
+
+        # Build substructure cache (parsed Mols + pattern fingerprints).
+        # One-time cost per DB load; eliminates per-search SMILES re-parsing
+        # and screens out most candidates before GetSubstructMatch.
+        t0 = time.perf_counter()
+        sub_ids, sub_mols, sub_patt_fps = _build_substructure_cache(mol_map)
+        sub_build_s = time.perf_counter() - t0
+        log.info(f"Substructure cache: {len(sub_mols):,}/{len(mol_map):,} mols in {sub_build_s:.1f}s")
+
         with _state_lock:
             _state["engine"] = engine
             _state["mol_map"] = mol_map
             _state["db_path"] = path
             _state["fp_name"] = fp_name
             _state["mol_count"] = len(mol_map)
+            _state["sub_ids"] = sub_ids
+            _state["sub_mols"] = sub_mols
+            _state["sub_patt_fps"] = sub_patt_fps
 
-        return {"ok": True, "mol_count": len(mol_map), "fp_name": fp_name, "path": path}
+        return {
+            "ok": True,
+            "mol_count": len(mol_map),
+            "fp_name": fp_name,
+            "path": path,
+            "sub_cache_count": len(sub_mols),
+            "sub_cache_build_s": round(sub_build_s, 2),
+        }
     except Exception as exc:
         log.exception("load_db failed")
         return JSONResponse({"error": str(exc)}, status_code=500)
@@ -2017,14 +2082,18 @@ function renderResults(data) {
   _renderTable();
 }
 
-function _renderTable() {
-  const sorted = currentResults.slice().sort(function(a, b) {
+function _sortedResults() {
+  return currentResults.slice().sort(function(a, b) {
     let av = a[sortCol], bv = b[sortCol];
     if (av === null || av === undefined) av = '';
     if (bv === null || bv === undefined) bv = '';
     if (typeof av === 'string') return sortDir * av.localeCompare(bv);
     return sortDir * (av - bv);
   });
+}
+
+function _renderTable() {
+  const sorted = _sortedResults();
 
   // Update sort icons
   document.querySelectorAll('th.sortable').forEach(function(th) {
@@ -2130,13 +2199,7 @@ function sortTable(col) {
 
 // ── SMILES actions ─────────────────────────────────────────────────────────
 function copySmiles(i) {
-  const sorted = currentResults.slice().sort(function(a, b) {
-    let av = a[sortCol], bv = b[sortCol];
-    if (av === null || av === undefined) av = '';
-    if (bv === null || bv === undefined) bv = '';
-    if (typeof av === 'string') return sortDir * av.localeCompare(bv);
-    return sortDir * (av - bv);
-  });
+  const sorted = _sortedResults();
   const smi = sorted[i] ? sorted[i].smiles : '';
   if (smi && navigator.clipboard) {
     navigator.clipboard.writeText(smi).catch(function() {});
@@ -2144,13 +2207,7 @@ function copySmiles(i) {
 }
 
 function useAsQuery(i) {
-  const sorted = currentResults.slice().sort(function(a, b) {
-    let av = a[sortCol], bv = b[sortCol];
-    if (av === null || av === undefined) av = '';
-    if (bv === null || bv === undefined) bv = '';
-    if (typeof av === 'string') return sortDir * av.localeCompare(bv);
-    return sortDir * (av - bv);
-  });
+  const sorted = _sortedResults();
   const smi = sorted[i] ? sorted[i].smiles : '';
   if (smi) {
     document.getElementById('query-smiles').value = smi;
@@ -2161,8 +2218,9 @@ function useAsQuery(i) {
 // ── Export CSV ─────────────────────────────────────────────────────────────
 function exportCsv() {
   if (!currentResults.length) return;
+  const sorted = _sortedResults();
   const header = ['Index', 'Name', 'Score', 'MW', 'ClogP', 'SMILES'];
-  const rows = currentResults.map(function(r, i) {
+  const rows = sorted.map(function(r, i) {
     return [
       i + 1,
       csvEsc(r.name || ''),
