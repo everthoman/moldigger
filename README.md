@@ -12,6 +12,7 @@ MolDigger is a molecular structure search and clustering tool available as both 
 - **Substructure search** — SMILES or SMARTS queries with multi-threaded RDKit matching
 - **Clustering** — Butina clustering of search results with adjustable similarity cutoff; cluster ID column added to results table; always uses Morgan ECFP4 for best chemical groupings
 - **Atom highlighting** — MCS highlighted in similarity hits; matched atoms highlighted in substructure hits (optional, uses RDKit default highlight colour)
+- **Named lists with boolean combinators** — save hits as a list (all, selected rows, or imported SMILES), then combine lists with AND / OR / NOT / XOR
 - **GPU acceleration** — NVIDIA CUDA via FPSim2's CudaEngine (Tanimoto only)
 - **Multiple fingerprint types** — Morgan/ECFP4, ECFP6, FCFP4, RDKit Topological, MACCS Keys, Atom Pairs, Topological Torsion
 - **Auto-detects fingerprint type** from the loaded database file
@@ -163,6 +164,34 @@ After a search, a **Cluster** toolbar appears above the results table. Clusterin
 Clustering always uses **Morgan ECFP4** fingerprints (radius=2, 2048 bits) regardless of the fingerprint type used for the similarity search, as Morgan ECFP4 gives the best chemical groupings for diverse compound sets.
 
 The underlying algorithm is Butina clustering (`rdkit.ML.Cluster.Butina`), which is a standard single-pass, sphere-exclusion method widely used in cheminformatics.
+
+---
+
+## Lists
+
+Named **lists** of molecule IDs can be saved per-database and combined with boolean operators. Useful for stacking searches: e.g. "compounds matching scaffold A *and not* a known toxicophore".
+
+### Creating lists
+
+Three ways:
+
+1. **Save all results** — after any search, click **★ Save all as list** in the results header. Prompts for a name; saves every hit currently shown.
+2. **Save selected rows** — tick the checkboxes in the first column of the results table (or the header box for "select all visible"), then click **★ Save selected as list**.
+3. **Import from SMILES** — paste a list of SMILES into the Lists card (one per line) and click **Import**. Each line is canonicalized via RDKit and looked up in the loaded database; unmatched entries are reported in the status message.
+
+### Combining lists
+
+In the Lists card's combiner:
+
+1. Pick an operator (`AND`, `OR`, `NOT`, `XOR`) and a list, then click **Add** to push a step onto the expression.
+2. Repeat to build a sequence. Steps evaluate left-to-right against an accumulator.
+3. Click **Run** — the result loads into the main results table, where it can be sorted, clustered, exported, or saved as a new list.
+
+**NOT semantics:** if `NOT` is the *first* step, the accumulator starts as the full database minus the named list. Otherwise `NOT` is a set-subtract from the accumulator. So `[OR A, NOT B]` means *A minus B*, and `[NOT A]` means *everything except A*.
+
+### Storage
+
+Lists are stored in `~/.moldigger/lists.json`, keyed by the resolved absolute path of each database file. The lists shown in the UI are scoped to the currently-loaded database. Switching databases shows a different set of lists; the file itself is shared across all databases on the host.
 
 ---
 

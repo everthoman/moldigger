@@ -378,6 +378,152 @@ def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None,
         })
     return rows
 
+# ── Lists store ───────────────────────────────────────────────────────────────
+#
+# Server-global file at ~/.moldigger/lists.json keyed by absolute DB path:
+#   {
+#     "/abs/path/to/db.h5": {
+#       "list_name": {"created": "ISO-8601", "ids": [int, int, ...]},
+#       ...
+#     },
+#     ...
+#   }
+# IDs are mol_id integers (FPSim2 sequential IDs from the .h5).
+
+LISTS_DIR = Path.home() / ".moldigger"
+LISTS_PATH = LISTS_DIR / "lists.json"
+_lists_lock = threading.Lock()
+
+
+def _lists_load_all() -> dict:
+    if not LISTS_PATH.exists():
+        return {}
+    try:
+        with open(LISTS_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return {}
+        return data
+    except Exception as exc:
+        log.warning(f"Could not read lists file, treating as empty: {exc}")
+        return {}
+
+
+def _lists_save_all(data: dict) -> None:
+    LISTS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = LISTS_PATH.with_suffix(".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, LISTS_PATH)
+
+
+def _lists_db_key() -> str | None:
+    """Absolute path of the currently-loaded DB, used as the key in lists.json."""
+    with _state_lock:
+        path = _state.get("db_path")
+    if not path:
+        return None
+    return str(Path(path).resolve())
+
+
+def _lists_for_current_db() -> dict:
+    """Read-only view of lists for the loaded DB, or {} if none / no DB loaded."""
+    key = _lists_db_key()
+    if not key:
+        return {}
+    with _lists_lock:
+        return dict(_lists_load_all().get(key, {}))
+
+
+def _lists_write_one(name: str, ids: list, overwrite: bool) -> tuple[bool, str]:
+    """Persist a single list under the current DB. Returns (ok, message)."""
+    key = _lists_db_key()
+    if not key:
+        return False, "No database loaded."
+    name = (name or "").strip()
+    if not name:
+        return False, "List name is required."
+    if any(c in name for c in "/\\\n\r\t"):
+        return False, "List name contains invalid characters."
+    clean_ids = sorted({int(i) for i in ids if i is not None})
+    with _lists_lock:
+        data = _lists_load_all()
+        bucket = data.setdefault(key, {})
+        if name in bucket and not overwrite:
+            return False, f"List '{name}' already exists."
+        bucket[name] = {
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "ids": clean_ids,
+        }
+        _lists_save_all(data)
+    return True, f"Saved list '{name}' ({len(clean_ids):,} molecules)."
+
+
+def _lists_delete_one(name: str) -> tuple[bool, str]:
+    key = _lists_db_key()
+    if not key:
+        return False, "No database loaded."
+    with _lists_lock:
+        data = _lists_load_all()
+        bucket = data.get(key, {})
+        if name not in bucket:
+            return False, f"List '{name}' not found."
+        del bucket[name]
+        if not bucket:
+            data.pop(key, None)
+        _lists_save_all(data)
+    return True, f"Deleted list '{name}'."
+
+
+def _lists_resolve_smiles(smiles_list: list) -> tuple[list, list]:
+    """Resolve a list of SMILES strings to mol_ids in the loaded DB.
+
+    Returns (resolved_ids, unresolved_smiles). Matching is by canonical SMILES;
+    builds a one-shot SMILES -> mol_id index from mol_map.
+    """
+    if not RDKIT_OK:
+        return [], list(smiles_list)
+    with _state_lock:
+        mol_map = dict(_state["mol_map"])
+    if not mol_map:
+        return [], list(smiles_list)
+    # Build canonical SMILES index (mol_map stores already-canonical SMILES from
+    # build_db, but we re-canonicalize defensively).
+    idx = {}
+    for mid_str, entry in mol_map.items():
+        smi = entry.get("smiles", "") if isinstance(entry, dict) else str(entry)
+        if not smi:
+            continue
+        idx.setdefault(smi, int(mid_str))
+    resolved, missing = [], []
+    for raw in smiles_list:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        # Try as-is, then canonicalized.
+        hit = idx.get(s)
+        if hit is None:
+            mol = Chem.MolFromSmiles(s)
+            if mol is not None:
+                try:
+                    canon = Chem.MolToSmiles(mol, canonical=True)
+                    hit = idx.get(canon)
+                except Exception:
+                    pass
+        if hit is None:
+            missing.append(s)
+        else:
+            resolved.append(hit)
+    return resolved, missing
+
+
+def _lists_universe() -> set:
+    """All mol_ids in the loaded DB. Used for NOT semantics."""
+    with _state_lock:
+        mol_map = dict(_state["mol_map"])
+    return {int(k) for k in mol_map.keys()}
+
+
 # ── Substructure cache ────────────────────────────────────────────────────────
 
 _SUBCACHE_VERSION = 1
@@ -911,6 +1057,112 @@ def api_cluster(req: ClusterRequest):
     return {"cluster_ids": cluster_ids}
 
 
+# ── Lists endpoints ───────────────────────────────────────────────────────────
+
+class ListCreateRequest(BaseModel):
+    name: str
+    mol_ids: list[int] = []
+    smiles: list[str] = []
+    overwrite: bool = False
+
+
+class ListCombineStep(BaseModel):
+    op: str
+    name: str
+
+
+class ListCombineRequest(BaseModel):
+    steps: list[ListCombineStep]
+    highlight: bool = True
+    max_results: int = 0  # 0 = unlimited
+
+
+@app.get("/api/lists")
+def api_lists_get():
+    items = _lists_for_current_db()
+    out = {
+        name: {"count": len(entry.get("ids", [])), "created": entry.get("created", "")}
+        for name, entry in items.items()
+    }
+    return {"lists": out, "db_path": _lists_db_key()}
+
+
+@app.post("/api/lists")
+def api_lists_create(req: ListCreateRequest):
+    if not _lists_db_key():
+        return JSONResponse({"error": "No database loaded."}, status_code=400)
+    ids = list(req.mol_ids)
+    unresolved = []
+    if req.smiles:
+        resolved, unresolved = _lists_resolve_smiles(req.smiles)
+        ids.extend(resolved)
+    if not ids:
+        msg = "No molecule IDs to save."
+        if unresolved:
+            msg += f" ({len(unresolved)} SMILES could not be resolved.)"
+        return JSONResponse({"error": msg}, status_code=400)
+    ok, msg = _lists_write_one(req.name, ids, req.overwrite)
+    if not ok:
+        return JSONResponse({"error": msg}, status_code=400)
+    return {"ok": True, "message": msg, "count": len(set(ids)), "unresolved": unresolved}
+
+
+@app.delete("/api/lists/{name}")
+def api_lists_delete(name: str):
+    ok, msg = _lists_delete_one(name)
+    if not ok:
+        return JSONResponse({"error": msg}, status_code=404)
+    return {"ok": True, "message": msg}
+
+
+@app.post("/api/lists/combine")
+def api_lists_combine(req: ListCombineRequest):
+    if not _lists_db_key():
+        return JSONResponse({"error": "No database loaded."}, status_code=400)
+    if not req.steps:
+        return JSONResponse({"error": "No combine steps given."}, status_code=400)
+
+    bucket = _lists_for_current_db()
+    # Validate names + ops first so we fail fast and with a clear message.
+    valid_ops = {"AND", "OR", "NOT", "XOR"}
+    for s in req.steps:
+        if s.op.upper() not in valid_ops:
+            return JSONResponse({"error": f"Unknown operator: {s.op}"}, status_code=400)
+        if s.name not in bucket:
+            return JSONResponse({"error": f"List '{s.name}' not found."}, status_code=400)
+
+    # Evaluate left-to-right.
+    #   - First step's op is treated as the seed: AND/OR/XOR start from list; NOT starts from universe-list.
+    #   - Subsequent NOT is interpreted as set-subtract.
+    acc: set | None = None
+    for s in req.steps:
+        op = s.op.upper()
+        members = {int(i) for i in bucket[s.name].get("ids", [])}
+        if acc is None:
+            acc = (_lists_universe() - members) if op == "NOT" else set(members)
+            continue
+        if op == "AND":
+            acc &= members
+        elif op == "OR":
+            acc |= members
+        elif op == "XOR":
+            acc ^= members
+        elif op == "NOT":
+            acc -= members
+
+    final_ids = sorted(acc or set())
+    if req.max_results > 0:
+        final_ids = final_ids[:req.max_results]
+
+    with _state_lock:
+        mol_map = dict(_state["mol_map"])
+    hits = [(mid, 1.0) for mid in final_ids]
+    rows = _build_result_rows(hits, mol_map, do_highlight=req.highlight)
+    for r in rows:
+        r["cluster_id"] = None
+    return {"rows": rows, "total": len(acc or set()), "elapsed": 0.0}
+
+
 @app.get("/api/mol_svg")
 def api_mol_svg(smiles: str = Query(""), w: int = Query(300), h: int = Query(200)):
     svg = smiles_to_svg(smiles, width=w, height=h)
@@ -1407,6 +1659,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   /* ── Row number ── */
   .row-num { color: var(--text-muted); font-size: 12px; min-width: 30px; }
+  .sel-col { width: 28px; text-align: center; padding: 0 4px; }
+  .sel-col input[type="checkbox"] { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -1602,6 +1856,61 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Lists card -->
+    <div class="card">
+      <div class="card-header" onclick="toggleListsCard()" style="cursor:pointer; display:flex; justify-content:space-between; align-items:center;">
+        <span>Lists</span>
+        <span id="lists-card-toggle" style="font-size:14px; color:var(--text-muted);">▾</span>
+      </div>
+      <div class="card-body" id="lists-card-body">
+
+        <!-- Saved lists -->
+        <div>
+          <label>Saved lists</label>
+          <div id="lists-saved" style="max-height:160px; overflow-y:auto; border:1px solid var(--border); border-radius:4px; padding:4px; background:var(--surface);">
+            <div style="color:var(--text-muted); font-size:12px; padding:4px;">No lists yet.</div>
+          </div>
+        </div>
+
+        <!-- Import from SMILES -->
+        <details style="margin-top:10px;">
+          <summary style="cursor:pointer; font-size:13px;">Import from SMILES</summary>
+          <div style="margin-top:6px;">
+            <textarea id="lists-import-smiles" rows="3" placeholder="One SMILES per line"></textarea>
+            <div class="input-row" style="margin-top:6px;">
+              <input type="text" id="lists-import-name" placeholder="List name">
+              <button class="btn btn-primary btn-sm" onclick="importListFromSmiles()">Import</button>
+            </div>
+            <div id="lists-import-status" class="status-msg"></div>
+          </div>
+        </details>
+
+        <!-- Boolean combiner -->
+        <div style="margin-top:14px; padding-top:10px; border-top:1px solid var(--border);">
+          <label>Combine lists</label>
+          <div id="combine-expr" style="min-height:30px; padding:4px; border:1px solid var(--border); border-radius:4px; background:var(--surface); margin-bottom:6px; font-size:13px;">
+            <span style="color:var(--text-muted); font-size:12px;">Expression is empty</span>
+          </div>
+          <div class="input-row" style="gap:4px;">
+            <select id="combine-op" style="flex:0 0 70px;">
+              <option value="AND">AND</option>
+              <option value="OR">OR</option>
+              <option value="NOT">NOT</option>
+              <option value="XOR">XOR</option>
+            </select>
+            <select id="combine-list" style="flex:1;"></select>
+            <button class="btn btn-ghost btn-sm" onclick="combineExprAdd()">Add</button>
+          </div>
+          <div style="display:flex; gap:6px; margin-top:6px;">
+            <button class="btn btn-primary btn-sm" onclick="combineRun()">Run</button>
+            <button class="btn btn-ghost btn-sm" onclick="combineExprClear()">Clear</button>
+          </div>
+          <div id="combine-status" class="status-msg"></div>
+        </div>
+
+      </div>
+    </div>
+
   </aside>
 
   <!-- Main content -->
@@ -1612,8 +1921,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="results-info">
         <strong id="hit-count">0</strong> hits
         &nbsp;<span id="elapsed-info" style="color:var(--text-muted)"></span>
+        &nbsp;<span id="selection-info" style="color:var(--text-muted)"></span>
       </div>
-      <button class="btn btn-ghost btn-sm" onclick="exportCsv()">⬇ Export CSV</button>
+      <div style="display:flex; gap:8px;">
+        <button class="btn btn-ghost btn-sm" id="save-selected-btn" onclick="saveSelectedAsList()" style="display:none;">★ Save selected as list</button>
+        <button class="btn btn-ghost btn-sm" onclick="saveAllAsList()">★ Save all as list</button>
+        <button class="btn btn-ghost btn-sm" onclick="exportCsv()">⬇ Export CSV</button>
+      </div>
     </div>
 
     <!-- Cluster bar — shown after results arrive -->
@@ -1638,6 +1952,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <table id="results-table">
         <thead>
           <tr>
+            <th class="sel-col"><input type="checkbox" id="select-all-cb" onclick="toggleSelectAll(this)" title="Select all visible"></th>
             <th class="row-num">#</th>
             <th class="cluster-col" style="display:none;" onclick="sortTable('cluster_id')" title="Butina cluster ID">Cluster</th>
             <th class="sortable" onclick="sortTable('name')">Name <span class="sort-icon"></span></th>
@@ -1774,6 +2089,7 @@ python moldigger_web.py --port 9000           # custom port</pre>
 <script>
 // ── State ──────────────────────────────────────────────────────────────────
 let currentResults = [];
+let selectedMolIds = new Set();
 let currentSearchType = 'similarity';
 let sortCol = 'score';
 let sortDir = -1; // -1 desc, 1 asc
@@ -1835,6 +2151,7 @@ function loadStatus() {
       if (d.db_path) {
         document.getElementById('db-path').value = d.db_path;
         showDbInfo(d.mol_count, d.fp_name);
+        refreshLists();
       }
     })
     .catch(function(e) { console.error('status error', e); });
@@ -1987,6 +2304,7 @@ function loadDb() {
       } else {
         showStatus('db-status', 'success', 'Database loaded.');
         showDbInfo(d.mol_count, d.fp_name);
+        refreshLists();  // lists are per-DB; refresh after load
       }
     })
     .catch(function(e) { showStatus('db-status', 'error', String(e)); });
@@ -2144,6 +2462,8 @@ function _doPoll(jid, context) {
 // ── Render results ─────────────────────────────────────────────────────────
 function renderResults(data) {
   currentResults = data.rows || [];
+  selectedMolIds = new Set();  // fresh result set ⇒ clear selection
+  _updateSelectionInfo();
   const total = data.total || 0;
   const metricLabel = currentSearchType === 'substructure' ? 'Substructure'
     : (document.getElementById('metric-select').options[document.getElementById('metric-select').selectedIndex].text);
@@ -2217,7 +2537,9 @@ function _renderTable() {
     }
 
     const clusterDisplay = (row.cluster_id !== null && row.cluster_id !== undefined) ? '' : 'none';
+    const checked = selectedMolIds.has(row.mol_id) ? ' checked' : '';
     tr.innerHTML =
+      '<td class="sel-col"><input type="checkbox" data-mol-id="' + row.mol_id + '" onclick="toggleRowSelect(this)"' + checked + '></td>' +
       '<td class="row-num">' + (i + 1) + '</td>' +
       '<td class="cluster-col prop-cell" style="display:' + clusterDisplay + ';">' + (row.cluster_id !== null && row.cluster_id !== undefined ? row.cluster_id : '') + '</td>' +
       '<td class="name-cell" title="' + escHtml(row.name || '') + '">' + escHtml(truncate(row.name || '', 24)) + '</td>' +
@@ -2235,6 +2557,45 @@ function _renderTable() {
 
     tbody.appendChild(tr);
   });
+
+  _updateSelectAllCheckbox();
+}
+
+// ── Selection ──────────────────────────────────────────────────────────────
+function toggleRowSelect(cb) {
+  const id = parseInt(cb.getAttribute('data-mol-id'), 10);
+  if (cb.checked) selectedMolIds.add(id);
+  else selectedMolIds.delete(id);
+  _updateSelectionInfo();
+  _updateSelectAllCheckbox();
+}
+
+function toggleSelectAll(cb) {
+  if (cb.checked) {
+    currentResults.forEach(function(r) { selectedMolIds.add(r.mol_id); });
+  } else {
+    currentResults.forEach(function(r) { selectedMolIds.delete(r.mol_id); });
+  }
+  // Refresh row checkboxes without rebuilding the whole table.
+  document.querySelectorAll('#results-tbody input[type="checkbox"][data-mol-id]').forEach(function(box) {
+    const id = parseInt(box.getAttribute('data-mol-id'), 10);
+    box.checked = selectedMolIds.has(id);
+  });
+  _updateSelectionInfo();
+}
+
+function _updateSelectAllCheckbox() {
+  const cb = document.getElementById('select-all-cb');
+  if (!cb || !currentResults.length) { if (cb) { cb.checked = false; cb.indeterminate = false; } return; }
+  const selectedInResults = currentResults.filter(function(r) { return selectedMolIds.has(r.mol_id); }).length;
+  cb.checked = selectedInResults === currentResults.length;
+  cb.indeterminate = selectedInResults > 0 && selectedInResults < currentResults.length;
+}
+
+function _updateSelectionInfo() {
+  const n = selectedMolIds.size;
+  document.getElementById('selection-info').textContent = n > 0 ? ('— ' + n + ' selected') : '';
+  document.getElementById('save-selected-btn').style.display = n > 0 ? '' : 'none';
 }
 
 function scoreStyle(score) {
@@ -2342,6 +2703,205 @@ function exportCsv() {
   a.download = 'moldigger_results.csv';
   a.click();
   URL.revokeObjectURL(url);
+}
+
+// ── Lists feature ──────────────────────────────────────────────────────────
+let combineExpr = []; // [{op, name}, ...]
+
+function toggleListsCard() {
+  const body = document.getElementById('lists-card-body');
+  const tog = document.getElementById('lists-card-toggle');
+  if (body.style.display === 'none') {
+    body.style.display = '';
+    tog.textContent = '▾';
+  } else {
+    body.style.display = 'none';
+    tog.textContent = '▸';
+  }
+}
+
+function refreshLists() {
+  fetch('/api/lists')
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      const lists = d.lists || {};
+      const names = Object.keys(lists).sort();
+      const savedEl = document.getElementById('lists-saved');
+      const sel = document.getElementById('combine-list');
+      if (names.length === 0) {
+        savedEl.innerHTML = '<div style="color:var(--text-muted); font-size:12px; padding:4px;">No lists yet.</div>';
+        sel.innerHTML = '<option value="">— no lists —</option>';
+        return;
+      }
+      savedEl.innerHTML = names.map(function(name) {
+        const meta = lists[name];
+        return '<div style="display:flex; justify-content:space-between; align-items:center; padding:3px 4px; font-size:13px; border-bottom:1px solid var(--border);">'
+          + '<span style="cursor:pointer;" title="Load this list as results" onclick="loadList(' + JSON.stringify(name).replace(/"/g, '&quot;') + ')">'
+          + escHtml(name) + ' <span style="color:var(--text-muted); font-size:11px;">(' + meta.count.toLocaleString() + ')</span></span>'
+          + '<button class="action-btn" onclick="deleteList(' + JSON.stringify(name).replace(/"/g, '&quot;') + ')" title="Delete">✕</button>'
+          + '</div>';
+      }).join('');
+      sel.innerHTML = names.map(function(name) {
+        return '<option value="' + escHtml(name) + '">' + escHtml(name) + ' (' + lists[name].count + ')</option>';
+      }).join('');
+    })
+    .catch(function() {});
+}
+
+function saveAllAsList() {
+  if (!currentResults.length) { alert('No results to save.'); return; }
+  const name = prompt('Save all ' + currentResults.length + ' results as a list. Name?');
+  if (!name) return;
+  const ids = currentResults.map(function(r) { return r.mol_id; });
+  _postList(name, ids);
+}
+
+function saveSelectedAsList() {
+  if (selectedMolIds.size === 0) { alert('No rows selected.'); return; }
+  const name = prompt('Save ' + selectedMolIds.size + ' selected rows as a list. Name?');
+  if (!name) return;
+  const ids = Array.from(selectedMolIds);
+  _postList(name, ids);
+}
+
+function _postList(name, ids) {
+  fetch('/api/lists', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name, mol_ids: ids, overwrite: false})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) {
+        if (d.error.indexOf('already exists') >= 0 && confirm(d.error + ' Overwrite?')) {
+          fetch('/api/lists', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name, mol_ids: ids, overwrite: true})
+          }).then(function(r) { return r.json(); }).then(function(d2) {
+            if (d2.error) alert('Save failed: ' + d2.error);
+            else { refreshLists(); }
+          });
+        } else {
+          alert('Save failed: ' + d.error);
+        }
+      } else {
+        refreshLists();
+      }
+    })
+    .catch(function(e) { alert('Save failed: ' + e); });
+}
+
+function importListFromSmiles() {
+  const name = document.getElementById('lists-import-name').value.trim();
+  const raw = document.getElementById('lists-import-smiles').value;
+  const status = document.getElementById('lists-import-status');
+  if (!name) { showStatus('lists-import-status', 'error', 'Name is required.'); return; }
+  const smiles = raw.split(/\r?\n/).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+  if (smiles.length === 0) { showStatus('lists-import-status', 'error', 'No SMILES provided.'); return; }
+  fetch('/api/lists', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name, smiles: smiles, overwrite: false})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) {
+        if (d.error.indexOf('already exists') >= 0 && confirm(d.error + ' Overwrite?')) {
+          fetch('/api/lists', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: name, smiles: smiles, overwrite: true})
+          }).then(function(r) { return r.json(); }).then(function(d2) {
+            if (d2.error) showStatus('lists-import-status', 'error', d2.error);
+            else { showStatus('lists-import-status', 'success', d2.message + (d2.unresolved && d2.unresolved.length ? ' — ' + d2.unresolved.length + ' unresolved.' : '')); refreshLists(); }
+          });
+        } else {
+          showStatus('lists-import-status', 'error', d.error);
+        }
+      } else {
+        showStatus('lists-import-status', 'success', d.message + (d.unresolved && d.unresolved.length ? ' — ' + d.unresolved.length + ' unresolved.' : ''));
+        refreshLists();
+      }
+    })
+    .catch(function(e) { showStatus('lists-import-status', 'error', String(e)); });
+}
+
+function deleteList(name) {
+  if (!confirm('Delete list "' + name + '"?')) return;
+  fetch('/api/lists/' + encodeURIComponent(name), {method: 'DELETE'})
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) alert(d.error);
+      else refreshLists();
+    });
+}
+
+function loadList(name) {
+  // Run a single-step combine ("OR <name>") to load this list as results.
+  fetch('/api/lists/combine', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({steps: [{op: 'OR', name: name}], highlight: true})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) { alert(d.error); return; }
+      currentSearchType = 'list';
+      renderResults(d);
+      showStatus('search-status', 'success', 'Loaded list "' + name + '" — ' + d.total + ' molecules.');
+    });
+}
+
+function combineExprAdd() {
+  const op = document.getElementById('combine-op').value;
+  const name = document.getElementById('combine-list').value;
+  if (!name) return;
+  combineExpr.push({op: op, name: name});
+  _renderCombineExpr();
+}
+
+function combineExprClear() {
+  combineExpr = [];
+  _renderCombineExpr();
+  document.getElementById('combine-status').textContent = '';
+}
+
+function _renderCombineExpr() {
+  const el = document.getElementById('combine-expr');
+  if (combineExpr.length === 0) {
+    el.innerHTML = '<span style="color:var(--text-muted); font-size:12px;">Expression is empty</span>';
+    return;
+  }
+  el.innerHTML = combineExpr.map(function(step, i) {
+    return '<span style="display:inline-block; padding:2px 6px; margin:2px; border-radius:3px; background:var(--bg);">'
+      + '<strong>' + step.op + '</strong> ' + escHtml(step.name)
+      + ' <a href="#" onclick="combineExprRemove(' + i + '); return false;" style="color:var(--error); text-decoration:none;">✕</a>'
+      + '</span>';
+  }).join(' ');
+}
+
+function combineExprRemove(i) {
+  combineExpr.splice(i, 1);
+  _renderCombineExpr();
+}
+
+function combineRun() {
+  if (combineExpr.length === 0) { showStatus('combine-status', 'error', 'Expression is empty.'); return; }
+  showStatus('combine-status', 'info', 'Running…');
+  fetch('/api/lists/combine', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({steps: combineExpr, highlight: true})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) { showStatus('combine-status', 'error', d.error); return; }
+      currentSearchType = 'list';
+      renderResults(d);
+      showStatus('combine-status', 'success', 'Combined ' + combineExpr.length + ' lists → ' + d.total + ' molecules.');
+    })
+    .catch(function(e) { showStatus('combine-status', 'error', String(e)); });
 }
 
 function csvEsc(s) {
