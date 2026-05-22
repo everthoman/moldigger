@@ -18,6 +18,7 @@ import os
 import io
 import json
 import time
+import pickle
 import logging
 import tempfile
 import threading
@@ -42,6 +43,7 @@ try:
     from rdkit import Chem
     from rdkit.Chem import Draw, AllChem, Descriptors, rdMolDescriptors
     from rdkit.Chem.Draw import rdMolDraw2D
+    from rdkit.DataStructs import ExplicitBitVect
     RDKIT_OK = True
 except ImportError:
     pass
@@ -378,6 +380,78 @@ def _build_result_rows(hits, mol_map: dict, match_atoms: dict | None = None,
 
 # ── Substructure cache ────────────────────────────────────────────────────────
 
+_SUBCACHE_VERSION = 1
+
+
+def _subcache_path(db_path: str) -> str:
+    return db_path + ".subcache.pkl"
+
+
+def _source_mtimes(db_path: str) -> tuple:
+    """Return mtimes of files that, if changed, should invalidate the cache."""
+    db_mt = os.path.getmtime(db_path) if os.path.exists(db_path) else 0.0
+    companion = db_path + ".smiles.json"
+    cm_mt = os.path.getmtime(companion) if os.path.exists(companion) else 0.0
+    return (db_mt, cm_mt)
+
+
+def _save_substructure_cache(db_path: str, ids, mols, fps) -> int:
+    """Pickle the cache next to the .h5. Returns bytes written, or 0 on failure."""
+    if not RDKIT_OK or not mols:
+        return 0
+    cache_path = _subcache_path(db_path)
+    try:
+        payload = {
+            "version": _SUBCACHE_VERSION,
+            "source_mtimes": _source_mtimes(db_path),
+            "ids": ids,
+            "mol_bins": [m.ToBinary() for m in mols],
+            "fp_bins": [fp.ToBinary() for fp in fps],
+        }
+        tmp = cache_path + ".tmp"
+        with open(tmp, "wb") as fh:
+            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, cache_path)
+        return os.path.getsize(cache_path)
+    except Exception as exc:
+        log.warning(f"Could not save substructure cache: {exc}")
+        try:
+            if os.path.exists(cache_path + ".tmp"):
+                os.remove(cache_path + ".tmp")
+        except Exception:
+            pass
+        return 0
+
+
+def _load_substructure_cache(db_path: str):
+    """Try to load a valid cache. Returns (ids, mols, fps) or None if missing/stale."""
+    if not RDKIT_OK:
+        return None
+    cache_path = _subcache_path(db_path)
+    if not os.path.exists(cache_path):
+        return None
+    try:
+        with open(cache_path, "rb") as fh:
+            payload = pickle.load(fh)
+    except Exception as exc:
+        log.warning(f"Substructure cache unreadable, will rebuild: {exc}")
+        return None
+    if payload.get("version") != _SUBCACHE_VERSION:
+        log.info("Substructure cache version mismatch — rebuilding.")
+        return None
+    if tuple(payload.get("source_mtimes", ())) != _source_mtimes(db_path):
+        log.info("Substructure cache stale (source mtime changed) — rebuilding.")
+        return None
+    try:
+        ids = payload["ids"]
+        mols = [Chem.Mol(b) for b in payload["mol_bins"]]
+        fps = [ExplicitBitVect(b) for b in payload["fp_bins"]]
+    except Exception as exc:
+        log.warning(f"Substructure cache deserialize failed, will rebuild: {exc}")
+        return None
+    return ids, mols, fps
+
+
 def _build_substructure_cache(mol_map: dict, progress_cb=None):
     """Parse each db SMILES once and compute a PatternFingerprint for screening.
 
@@ -695,13 +769,24 @@ def api_load_db(req: LoadDbRequest):
 
         fp_name = _fp_name_from_engine(engine)
 
-        # Build substructure cache (parsed Mols + pattern fingerprints).
-        # One-time cost per DB load; eliminates per-search SMILES re-parsing
-        # and screens out most candidates before GetSubstructMatch.
+        # Substructure cache (parsed Mols + pattern fingerprints).
+        # Try disk first; fall back to a fresh build and persist on success.
+        sub_cache_source = "disk"
+        sub_cache_bytes = 0
         t0 = time.perf_counter()
-        sub_ids, sub_mols, sub_patt_fps = _build_substructure_cache(mol_map)
+        cached = _load_substructure_cache(path)
+        if cached is not None:
+            sub_ids, sub_mols, sub_patt_fps = cached
+        else:
+            sub_cache_source = "build"
+            sub_ids, sub_mols, sub_patt_fps = _build_substructure_cache(mol_map)
+            sub_cache_bytes = _save_substructure_cache(path, sub_ids, sub_mols, sub_patt_fps)
         sub_build_s = time.perf_counter() - t0
-        log.info(f"Substructure cache: {len(sub_mols):,}/{len(mol_map):,} mols in {sub_build_s:.1f}s")
+        log.info(
+            f"Substructure cache: {len(sub_mols):,}/{len(mol_map):,} mols "
+            f"({sub_cache_source}) in {sub_build_s:.1f}s"
+            + (f", saved {sub_cache_bytes / 1e6:.1f} MB" if sub_cache_bytes else "")
+        )
 
         with _state_lock:
             _state["engine"] = engine
@@ -720,6 +805,7 @@ def api_load_db(req: LoadDbRequest):
             "path": path,
             "sub_cache_count": len(sub_mols),
             "sub_cache_build_s": round(sub_build_s, 2),
+            "sub_cache_source": sub_cache_source,
         }
     except Exception as exc:
         log.exception("load_db failed")
