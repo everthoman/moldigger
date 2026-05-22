@@ -43,6 +43,7 @@ try:
     from rdkit import Chem
     from rdkit.Chem import Draw, AllChem, Descriptors, rdMolDescriptors
     from rdkit.Chem.Draw import rdMolDraw2D
+    from rdkit.Chem import rdSubstructLibrary
     from rdkit.DataStructs import ExplicitBitVect
     RDKIT_OK = True
 except ImportError:
@@ -122,13 +123,11 @@ _state = {
     "db_path": None,
     "fp_name": None,
     "mol_count": 0,
-    # Substructure-search cache (parallel arrays, built eagerly at load):
-    #   sub_ids[i]      -> mol_id key into mol_map
-    #   sub_mols[i]     -> rdkit.Chem.Mol (parsed once)
-    #   sub_patt_fps[i] -> ExplicitBitVect (PatternFingerprint, pre-screen)
+    # Substructure search uses RDKit's rdSubstructLibrary (C++, multi-threaded):
+    #   sub_library     -> rdSubstructLibrary.SubstructLibrary
+    #   sub_ids[i]      -> mol_id key into mol_map, for library index i
+    "sub_library": None,
     "sub_ids": [],
-    "sub_mols": [],
-    "sub_patt_fps": [],
 }
 
 _jobs = {}
@@ -549,13 +548,18 @@ def _lists_universe() -> set:
     return {int(k) for k in mol_map.keys()}
 
 
-# ── Substructure cache ────────────────────────────────────────────────────────
+# ── Substructure library cache ────────────────────────────────────────────────
+#
+# Substructure search is powered by RDKit's rdSubstructLibrary.SubstructLibrary
+# — a C++ multi-threaded engine with built-in pattern-FP screening. The library
+# is built once at DB load, persisted next to the .h5 file, and reloaded on
+# subsequent loads of the same DB.
 
-_SUBCACHE_VERSION = 1
+_SUBCACHE_VERSION = 2  # bumped: format changed from pickle to library serialization
 
 
 def _subcache_path(db_path: str) -> str:
-    return db_path + ".subcache.pkl"
+    return db_path + ".subcache.bin"
 
 
 def _source_mtimes(db_path: str) -> tuple:
@@ -566,22 +570,56 @@ def _source_mtimes(db_path: str) -> tuple:
     return (db_mt, cm_mt)
 
 
-def _save_substructure_cache(db_path: str, ids, mols, fps) -> int:
-    """Pickle the cache next to the .h5. Returns bytes written, or 0 on failure."""
-    if not RDKIT_OK or not mols:
+def _build_substructure_library(mol_map: dict):
+    """Build a SubstructLibrary + parallel ids list from the loaded DB.
+
+    Uses CachedTrustedSmilesMolHolder (skips sanitization on retrieval, the
+    SMILES from our build_db pipeline are already canonical & trusted) plus
+    PatternHolder for built-in pattern-FP screening.
+
+    Returns (library, ids). Entries that fail to parse are dropped.
+    """
+    if not RDKIT_OK or not mol_map:
+        return None, []
+    lib = rdSubstructLibrary.SubstructLibrary(
+        rdSubstructLibrary.CachedTrustedSmilesMolHolder(),
+        rdSubstructLibrary.PatternHolder(),
+    )
+    ids = []
+    for mid, entry in mol_map.items():
+        smi = entry.get("smiles", "") if isinstance(entry, dict) else str(entry)
+        if not smi:
+            continue
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            continue
+        try:
+            lib.AddMol(mol)
+        except Exception:
+            continue
+        ids.append(int(mid))
+    return lib, ids
+
+
+def _save_substructure_cache(db_path: str, library, ids) -> int:
+    """Persist library + ids to disk next to the .h5. Returns bytes written, or 0 on failure."""
+    if not RDKIT_OK or library is None or not ids:
         return 0
     cache_path = _subcache_path(db_path)
     try:
-        payload = {
+        lib_blob = library.Serialize()
+        header = {
             "version": _SUBCACHE_VERSION,
             "source_mtimes": _source_mtimes(db_path),
             "ids": ids,
-            "mol_bins": [m.ToBinary() for m in mols],
-            "fp_bins": [fp.ToBinary() for fp in fps],
         }
+        header_blob = pickle.dumps(header, protocol=pickle.HIGHEST_PROTOCOL)
         tmp = cache_path + ".tmp"
         with open(tmp, "wb") as fh:
-            pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            # Layout: [4 bytes BE: header length][header pickle][library blob]
+            fh.write(len(header_blob).to_bytes(4, "big"))
+            fh.write(header_blob)
+            fh.write(lib_blob)
         os.replace(tmp, cache_path)
         return os.path.getsize(cache_path)
     except Exception as exc:
@@ -595,7 +633,7 @@ def _save_substructure_cache(db_path: str, ids, mols, fps) -> int:
 
 
 def _load_substructure_cache(db_path: str):
-    """Try to load a valid cache. Returns (ids, mols, fps) or None if missing/stale."""
+    """Try to load a valid cache. Returns (library, ids) or None if missing/stale."""
     if not RDKIT_OK:
         return None
     cache_path = _subcache_path(db_path)
@@ -603,56 +641,25 @@ def _load_substructure_cache(db_path: str):
         return None
     try:
         with open(cache_path, "rb") as fh:
-            payload = pickle.load(fh)
+            hdr_len = int.from_bytes(fh.read(4), "big")
+            header = pickle.loads(fh.read(hdr_len))
+            lib_blob = fh.read()
     except Exception as exc:
         log.warning(f"Substructure cache unreadable, will rebuild: {exc}")
         return None
-    if payload.get("version") != _SUBCACHE_VERSION:
+    if header.get("version") != _SUBCACHE_VERSION:
         log.info("Substructure cache version mismatch — rebuilding.")
         return None
-    if tuple(payload.get("source_mtimes", ())) != _source_mtimes(db_path):
+    if tuple(header.get("source_mtimes", ())) != _source_mtimes(db_path):
         log.info("Substructure cache stale (source mtime changed) — rebuilding.")
         return None
     try:
-        ids = payload["ids"]
-        mols = [Chem.Mol(b) for b in payload["mol_bins"]]
-        fps = [ExplicitBitVect(b) for b in payload["fp_bins"]]
+        lib = rdSubstructLibrary.SubstructLibrary(lib_blob)
+        ids = header["ids"]
     except Exception as exc:
         log.warning(f"Substructure cache deserialize failed, will rebuild: {exc}")
         return None
-    return ids, mols, fps
-
-
-def _build_substructure_cache(mol_map: dict, progress_cb=None):
-    """Parse each db SMILES once and compute a PatternFingerprint for screening.
-
-    Returns (ids, mols, patt_fps) as parallel lists. Entries that fail to parse
-    are dropped. Safe to call without RDKit (returns empty lists).
-    """
-    if not RDKIT_OK or not mol_map:
-        return [], [], []
-    ids, mols, fps = [], [], []
-    total = len(mol_map)
-    step = max(1, total // 20)
-    for i, (mid, entry) in enumerate(mol_map.items()):
-        smi = entry.get("smiles", "") if isinstance(entry, dict) else str(entry)
-        if not smi:
-            continue
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
-            continue
-        try:
-            fp = Chem.PatternFingerprint(mol)
-        except Exception:
-            continue
-        ids.append(mid)
-        mols.append(mol)
-        fps.append(fp)
-        if progress_cb is not None and (i % step == 0):
-            progress_cb(i + 1, total)
-    if progress_cb is not None:
-        progress_cb(total, total)
-    return ids, mols, fps
+    return lib, ids
 
 
 # ── Search runners ────────────────────────────────────────────────────────────
@@ -717,9 +724,8 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
         update_job_progress(jid, "Starting substructure search…")
         with _state_lock:
             mol_map = dict(_state["mol_map"])
+            sub_library = _state["sub_library"]
             sub_ids = _state["sub_ids"]
-            sub_mols = _state["sub_mols"]
-            sub_patt_fps = _state["sub_patt_fps"]
 
         if not mol_map:
             finish_job(jid, error="No database loaded.")
@@ -729,8 +735,8 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
             finish_job(jid, error="RDKit not available for substructure search.")
             return
 
-        if not sub_mols:
-            finish_job(jid, error="Substructure cache not built. Reload the database.")
+        if sub_library is None or not sub_ids:
+            finish_job(jid, error="Substructure library not built. Reload the database.")
             return
 
         q = Chem.MolFromSmarts(query)
@@ -740,40 +746,37 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
             finish_job(jid, error="Could not parse query as SMARTS or SMILES.")
             return
 
-        try:
-            q_fp = Chem.PatternFingerprint(q)
-        except Exception:
-            q_fp = None
-
         t0 = time.perf_counter()
-        update_job_progress(jid, f"Searching {len(sub_mols):,} molecules…")
+        update_job_progress(jid, f"Searching {len(sub_ids):,} molecules…")
 
-        all_results = []
-        match_atoms = {}
-        screened = 0
-        for mid, mol, fp in zip(sub_ids, sub_mols, sub_patt_fps):
-            # Pattern-FP superset pre-screen: q_fp bits must be a subset of mol fp.
-            if q_fp is not None:
-                if (q_fp & fp) != q_fp:
-                    continue
-            screened += 1
-            match = mol.GetSubstructMatch(q)
-            if match:
-                all_results.append((mid, 1.0))
-                match_atoms[mid] = list(match)
-
+        # SubstructLibrary handles the FP screen + matching in C++, multi-threaded.
+        # numThreads=-1 uses all available cores. maxResults caps the search early.
+        cap = max_results if max_results > 0 else -1
+        match_indices = sub_library.GetMatches(q, numThreads=-1, maxResults=cap)
         elapsed = time.perf_counter() - t0
+
         update_job_progress(
             jid,
-            f"Found {len(all_results):,} hits in {elapsed:.3f}s "
-            f"({screened:,}/{len(sub_mols):,} survived FP screen), building results…",
+            f"Found {len(match_indices):,} hits in {elapsed:.3f}s, building results…",
         )
 
-        hits = all_results
-        if max_results > 0:
-            hits = hits[:max_results]
+        # Compute atom-level matches for the (few) hits, for highlighting.
+        match_atoms = {}
+        all_results = []
+        for idx in match_indices:
+            mid = sub_ids[idx]
+            all_results.append((mid, 1.0))
+            if do_highlight:
+                try:
+                    mol = sub_library.GetMol(idx)
+                    atoms = mol.GetSubstructMatch(q)
+                    if atoms:
+                        match_atoms[mid] = list(atoms)
+                except Exception:
+                    pass
 
-        rows = _build_result_rows(hits, mol_map, match_atoms=match_atoms, do_highlight=do_highlight)
+        rows = _build_result_rows(hits=all_results, mol_map=mol_map,
+                                  match_atoms=match_atoms, do_highlight=do_highlight)
         for r in rows:
             r["cluster_id"] = None
         finish_job(jid, result={"rows": rows, "total": len(all_results), "elapsed": elapsed})
@@ -947,14 +950,14 @@ def _perform_load_db(path: str) -> dict:
     t0 = time.perf_counter()
     cached = _load_substructure_cache(path)
     if cached is not None:
-        sub_ids, sub_mols, sub_patt_fps = cached
+        sub_library, sub_ids = cached
     else:
         sub_cache_source = "build"
-        sub_ids, sub_mols, sub_patt_fps = _build_substructure_cache(mol_map)
-        sub_cache_bytes = _save_substructure_cache(path, sub_ids, sub_mols, sub_patt_fps)
+        sub_library, sub_ids = _build_substructure_library(mol_map)
+        sub_cache_bytes = _save_substructure_cache(path, sub_library, sub_ids)
     sub_build_s = time.perf_counter() - t0
     log.info(
-        f"Substructure cache: {len(sub_mols):,}/{len(mol_map):,} mols "
+        f"Substructure library: {len(sub_ids):,}/{len(mol_map):,} mols "
         f"({sub_cache_source}) in {sub_build_s:.1f}s"
         + (f", saved {sub_cache_bytes / 1e6:.1f} MB" if sub_cache_bytes else "")
     )
@@ -965,9 +968,8 @@ def _perform_load_db(path: str) -> dict:
         _state["db_path"] = path
         _state["fp_name"] = fp_name
         _state["mol_count"] = len(mol_map)
+        _state["sub_library"] = sub_library
         _state["sub_ids"] = sub_ids
-        _state["sub_mols"] = sub_mols
-        _state["sub_patt_fps"] = sub_patt_fps
 
     _persist_last_db_path(path)
 
@@ -976,7 +978,7 @@ def _perform_load_db(path: str) -> dict:
         "mol_count": len(mol_map),
         "fp_name": fp_name,
         "path": path,
-        "sub_cache_count": len(sub_mols),
+        "sub_cache_count": len(sub_ids),
         "sub_cache_build_s": round(sub_build_s, 2),
         "sub_cache_source": sub_cache_source,
     }
