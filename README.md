@@ -132,6 +132,24 @@ Finds all molecules containing the query as a substructure. Accepts:
 
 Matched atoms are highlighted in the hit thumbnails. Runs on CPU using all configured worker threads.
 
+#### Note on query semantics
+
+MolDigger uses RDKit's substructure matcher, which is **strict about aromaticity and ring topology**. An aliphatic `N` in your query does not match an aromatic `n` in a target, and a benzene `c1ccccc1` does not match the 6-membered half of a fused indole — even though tools like DataWarrior would consider both a match. This is a difference in matching semantics, not a bug.
+
+If a query is rejecting hits you expect, relax the strict atoms by using SMARTS. For example, the SMILES query
+
+```
+O=S(c(cc1)ccc1N1CCNCC1)(Nc1ccccc1)=O
+```
+
+requires the second nitrogen's ring to be benzene, so molecules whose sulfonamide nitrogen is part of an indole are missed. Rewriting it as SMARTS without the aniline-ring constraint widens the search to those hits:
+
+```
+O=S(=O)(c1ccc(N2CCNCC2)cc1)[#7]
+```
+
+In general: use `[#7]` to match any nitrogen regardless of aromaticity, `[#6]` for any carbon, and drop ring-closure constraints where you don't care about the surrounding ring.
+
 ---
 
 ## Clustering
@@ -168,8 +186,9 @@ The fingerprint type is automatically detected from the loaded `.h5` file.
 
 - FPSim2 screens **millions of molecules in < 1 second** on CPU (multi-threaded)
 - GPU mode (CUDA) provides an additional **5–50× speedup** for large databases
-- Substructure search is parallelised across all CPU workers using `ThreadPoolExecutor`
-- The `.h5` database is memory-mapped — loading is near-instantaneous
+- Substructure search caches parsed RDKit Mols and `PatternFingerprint`s at DB-load time, then uses fingerprint superset pre-screening before running `GetSubstructMatch`. On a 137k-molecule database this drops a typical query from ~20 s to **well under 1 s**.
+- The substructure cache is persisted to disk next to the `.h5` file as `<db>.subcache.pkl` (≈ 1 KB / molecule). Subsequent loads of the same database deserialize from disk in seconds instead of rebuilding.
+- The `.h5` database itself is memory-mapped — loading is near-instantaneous
 - The results label reports both the **search time** (FPSim2/RDKit computation) and **total time** (including 2D rendering)
 
 ---

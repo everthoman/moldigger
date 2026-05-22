@@ -2168,8 +2168,20 @@ function renderResults(data) {
   _renderTable();
 }
 
+function _hasClusters() {
+  return currentResults.length > 0 && currentResults.some(function(r) {
+    return r.cluster_id !== null && r.cluster_id !== undefined;
+  });
+}
+
 function _sortedResults() {
+  const hasClusters = _hasClusters();
   return currentResults.slice().sort(function(a, b) {
+    if (hasClusters) {
+      const ca = (a.cluster_id !== null && a.cluster_id !== undefined) ? a.cluster_id : 999999;
+      const cb = (b.cluster_id !== null && b.cluster_id !== undefined) ? b.cluster_id : 999999;
+      if (ca !== cb) return ca - cb;
+    }
     let av = a[sortCol], bv = b[sortCol];
     if (av === null || av === undefined) av = '';
     if (bv === null || bv === undefined) bv = '';
@@ -2305,16 +2317,22 @@ function useAsQuery(i) {
 function exportCsv() {
   if (!currentResults.length) return;
   const sorted = _sortedResults();
-  const header = ['Index', 'Name', 'Score', 'MW', 'ClogP', 'SMILES'];
+  const hasClusters = _hasClusters();
+  const header = hasClusters
+    ? ['Index', 'Cluster', 'Name', 'Score', 'MW', 'ClogP', 'SMILES']
+    : ['Index', 'Name', 'Score', 'MW', 'ClogP', 'SMILES'];
   const rows = sorted.map(function(r, i) {
-    return [
+    const cluster = (r.cluster_id !== null && r.cluster_id !== undefined) ? r.cluster_id : '';
+    const cells = [
       i + 1,
       csvEsc(r.name || ''),
       r.score.toFixed(2),
       r.mw !== null && r.mw !== undefined ? r.mw.toFixed(1) : '',
       r.clogp !== null && r.clogp !== undefined ? r.clogp.toFixed(2) : '',
       csvEsc(r.smiles || ''),
-    ].join(',');
+    ];
+    if (hasClusters) cells.splice(1, 0, cluster);
+    return cells.join(',');
   });
   const csv = [header.join(',')].concat(rows).join('\n');
   const blob = new Blob([csv], {type: 'text/csv'});
