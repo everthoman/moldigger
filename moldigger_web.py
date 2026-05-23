@@ -2011,7 +2011,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           <tr>
             <th class="sel-col"><input type="checkbox" id="select-all-cb" onclick="toggleSelectAll(this)" title="Select all visible"></th>
             <th class="row-num">#</th>
-            <th class="cluster-col" style="display:none;" onclick="sortTable('cluster_id')" title="Butina cluster ID">Cluster</th>
+            <th class="sortable cluster-col" style="display:none;" onclick="sortTable('cluster_id')" title="Butina cluster ID">Cluster <span class="sort-icon"></span></th>
             <th class="sortable" onclick="sortTable('name')">Name <span class="sort-icon"></span></th>
             <th>Structure</th>
             <th class="sortable score-col" id="score-header" onclick="sortTable('score')">Score <span class="sort-icon"></span></th>
@@ -2560,6 +2560,11 @@ function _hasClusters() {
 function _sortedResults() {
   const hasClusters = _hasClusters();
   return currentResults.slice().sort(function(a, b) {
+    if (sortCol === 'cluster_id') {
+      const ca = (a.cluster_id !== null && a.cluster_id !== undefined) ? a.cluster_id : 999999;
+      const cb = (b.cluster_id !== null && b.cluster_id !== undefined) ? b.cluster_id : 999999;
+      return sortDir * (ca - cb);
+    }
     if (hasClusters) {
       const ca = (a.cluster_id !== null && a.cluster_id !== undefined) ? a.cluster_id : 999999;
       const cb = (b.cluster_id !== null && b.cluster_id !== undefined) ? b.cluster_id : 999999;
@@ -2715,7 +2720,7 @@ function sortTable(col) {
     sortDir *= -1;
   } else {
     sortCol = col;
-    sortDir = col === 'name' ? 1 : -1;
+    sortDir = (col === 'name' || col === 'cluster_id') ? 1 : -1;
   }
   _renderTable();
 }
