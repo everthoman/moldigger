@@ -133,6 +133,7 @@ _state = {
     "engine": None,
     "mol_map": {},   # {str(mol_id): {"smiles": ..., "name": ...}}
     "db_path": None,
+    "set_path": None,   # set to the .fpset directory path when loaded via alias
     "fp_name": None,
     "mol_count": 0,
     # Multi-FP set: when a DB is built with sibling FP files, these map
@@ -884,13 +885,27 @@ def _run_build_db(jid: str, input_path: str, output_path: str,
 
         multi = len(fp_specs) > 1
         out_p = Path(output_path)
-        base = out_p.with_suffix("") if out_p.suffix == ".h5" else out_p
+        # For a single-FP build the user's exact filename is preserved
+        # (legacy behavior). For a multi-FP build, the output becomes
+        # <base>.fpset/<base>.<tag>.h5 so the alias is the directory.
+        if out_p.suffix == ".h5":
+            base_stem = out_p.with_suffix("").name
+            parent_dir = out_p.parent
+        else:
+            base_stem = out_p.name
+            parent_dir = out_p.parent
+
+        if multi:
+            set_dir = parent_dir / f"{base_stem}.fpset"
+            set_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            set_dir = None
 
         output_files = []  # (fp_label, full_path)
         for label, _ft, _fp in fp_specs:
             if multi:
                 tag = _FP_TAGS.get(label, "fp")
-                out_path = f"{base}.{tag}.h5"
+                out_path = str(set_dir / f"{base_stem}.{tag}.h5")
             else:
                 out_path = output_path
             output_files.append((label, out_path))
@@ -914,7 +929,23 @@ def _run_build_db(jid: str, input_path: str, output_path: str,
             with open(companion, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh)
 
-        primary_path = output_files[0][1]
+        if multi:
+            primary_filename = Path(output_files[0][1]).name
+            manifest = {
+                "version": 1,
+                "name": base_stem,
+                "primary": primary_filename,
+                "variants": [
+                    {"fp": label, "file": Path(p).name}
+                    for label, p in output_files
+                ],
+            }
+            with open(set_dir / "manifest.json", "w", encoding="utf-8") as fh:
+                json.dump(manifest, fh, indent=2)
+            primary_path = str(set_dir)
+        else:
+            primary_path = output_files[0][1]
+
         update_job_progress(jid, f"Done — {len(entries):,} molecules indexed.")
         finish_job(jid, result={
             "path": primary_path,
@@ -982,6 +1013,7 @@ def api_status():
             "gpu": GPU_OK,
             "ketcher": (KETCHER_DIR / "index.html").exists(),
             "db_path": _state["db_path"],
+            "set_path": _state.get("set_path"),
             "fp_name": _state["fp_name"],
             "fp_variants": list((_state.get("fp_engines") or {}).keys()),
             "mol_count": _state["mol_count"],
@@ -1000,6 +1032,23 @@ def _perform_load_db(path: str) -> dict:
         raise FileNotFoundError(f"File not found: {path}")
     if not FPSIM2_OK:
         raise RuntimeError("FPSim2 is not installed")
+
+    # `.fpset` directories are aliases — resolve to the primary sibling .h5.
+    set_path: str | None = None
+    p = Path(path)
+    if p.is_dir() and p.name.endswith(".fpset"):
+        manifest_path = p / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"Set manifest missing: {manifest_path}")
+        with open(manifest_path, encoding="utf-8") as fh:
+            manifest = json.load(fh)
+        primary = manifest.get("primary")
+        if not primary:
+            raise ValueError(f"Set manifest has no 'primary': {manifest_path}")
+        set_path = str(p)
+        path = str(p / primary)
+        if not Path(path).exists():
+            raise FileNotFoundError(f"Primary sibling missing inside set: {path}")
 
     engine = FPSim2Engine(path)
     companion = path + ".smiles.json"
@@ -1062,6 +1111,7 @@ def _perform_load_db(path: str) -> dict:
         _state["engine"] = engine
         _state["mol_map"] = mol_map
         _state["db_path"] = path
+        _state["set_path"] = set_path
         _state["fp_name"] = fp_name
         _state["mol_count"] = len(mol_map)
         _state["fp_engines"] = fp_engines
@@ -1069,7 +1119,9 @@ def _perform_load_db(path: str) -> dict:
         _state["sub_library"] = sub_library
         _state["sub_ids"] = sub_ids
 
-    _persist_last_db_path(path)
+    # Persist the alias path when loaded from a set — restart preserves the
+    # alias view; the primary sibling is rediscovered on next load.
+    _persist_last_db_path(set_path or path)
 
     return {
         "ok": True,
@@ -1077,6 +1129,7 @@ def _perform_load_db(path: str) -> dict:
         "fp_name": fp_name,
         "fp_variants": list(fp_engines.keys()),
         "path": path,
+        "set_path": set_path,
         "sub_cache_count": len(sub_ids),
         "sub_cache_build_s": round(sub_build_s, 2),
         "sub_cache_source": sub_cache_source,
@@ -1113,8 +1166,10 @@ def api_switch_fp(req: SwitchFpRequest):
         _state["fp_name"] = req.fp_name
         _state["db_path"] = files[req.fp_name]
         new_path = _state["db_path"]
-    _persist_last_db_path(new_path)
-    return {"ok": True, "fp_name": req.fp_name, "path": new_path}
+        set_path = _state.get("set_path")
+    # When loaded as a set, persist the alias path so restart restores it.
+    _persist_last_db_path(set_path or new_path)
+    return {"ok": True, "fp_name": req.fp_name, "path": new_path, "set_path": set_path}
 
 
 @app.on_event("startup")
@@ -1373,7 +1428,27 @@ def api_fs(path: str = Query(""), mode: str = Query("h5")):
     dirs, files = [], []
     for e in sorted(entries, key=lambda x: (x.is_file(), x.name.lower())):
         try:
-            if e.is_dir() and not e.name.startswith("."):
+            is_set_dir = e.is_dir() and e.name.endswith(".fpset")
+            if mode == "h5" and is_set_dir:
+                manifest_path = e / "manifest.json"
+                variants = []
+                if manifest_path.exists():
+                    try:
+                        with open(manifest_path, encoding="utf-8") as fh:
+                            m = json.load(fh)
+                        variants = [v.get("fp", "?") for v in (m.get("variants") or [])]
+                    except (OSError, json.JSONDecodeError):
+                        variants = []
+                files.append({
+                    "name": e.name,
+                    "path": str(e),
+                    "kind": "set",
+                    "ready": bool(variants),
+                    "fp_count": len(variants),
+                    "fp_names": variants,
+                })
+                continue
+            if e.is_dir() and not e.name.startswith(".") and not is_set_dir:
                 dirs.append({"name": e.name, "path": str(e)})
             elif e.is_file():
                 n = e.name.lower()
@@ -2255,7 +2330,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <tr><td style="padding:4px 8px;">Atom Pairs</td><td style="padding:4px 8px;">Encodes atom-pair types</td></tr>
   <tr><td style="padding:4px 8px;">Topological Torsion</td><td style="padding:4px 8px;">Encodes torsion angles</td></tr>
 </table>
-<p>The fingerprint type is fixed per <code>.h5</code> file at build time. To switch FP at search time, build the database with several types ticked — MolDigger writes one sibling <code>.h5</code> per FP (e.g. <code>chembl.morgan_ecfp4.h5</code>, <code>chembl.maccs.h5</code>) and the <strong>Fingerprint</strong> dropdown in the search panel becomes a live switcher across them.</p>
+<p>The fingerprint type is fixed per <code>.h5</code> file at build time. To switch FP at search time, build the database with several types ticked — MolDigger collects the sibling <code>.h5</code> files into a <code>&lt;name&gt;.fpset</code> directory (with a manifest), which shows up in the file browser as a single 📦 entry. Loading the set opens all its FP engines, and the <strong>Fingerprint</strong> dropdown in the search panel becomes a live switcher across them.</p>
 
 <hr>
 
@@ -2500,6 +2575,15 @@ function browseFileDir(path) {
           <span class="fs-icon">&#128193;</span><span>${escHtml(dir.name)}</span></div>`;
       });
       d.files.forEach(f => {
+        if (f.kind === 'set') {
+          const fps = (f.fp_names || []).join(', ');
+          const badge = `<span style="margin-left:auto;font-size:10px;padding:2px 6px;border-radius:10px;background:#e0e7ff;color:#3730a3" title="${escHtml(fps)}">${f.fp_count} FPs</span>`;
+          html += `<div class="fs-row fs-file" data-file="${escHtml(f.path)}">
+            <span class="fs-icon">&#128230;</span>
+            <span>${escHtml(f.name)}<span style="color:var(--text-muted);font-size:11px;margin-left:6px">${escHtml(fps)}</span></span>
+            ${badge}</div>`;
+          return;
+        }
         let badge = '';
         if (_fbMode === 'h5') {
           badge = f.ready

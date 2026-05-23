@@ -108,15 +108,17 @@ The app writes a `.h5` FPSim2 database and a companion `.h5.smiles.json` file th
 
 ### Multi-FP databases
 
-A single FPSim2 `.h5` file holds one fingerprint type. If you tick more than one FP at build time, MolDigger writes a *set* of sibling files sharing the same source:
+A single FPSim2 `.h5` file holds one fingerprint type. If you tick more than one FP at build time, MolDigger collects the sibling files into a `.fpset` directory and writes a manifest so the set can be loaded as a single logical database:
 
 ```
-chembl.morgan_ecfp4.h5      + companion .smiles.json
-chembl.maccs.h5             + companion .smiles.json
-chembl.morgan_fcfp4.h5      + companion .smiles.json
+chembl.fpset/                      ← the alias entry point
+  manifest.json
+  chembl.morgan_ecfp4.h5           + companion .smiles.json
+  chembl.maccs.h5                  + companion .smiles.json
+  chembl.morgan_fcfp4.h5           + companion .smiles.json
 ```
 
-Each companion records the siblings, so loading any one of them auto-loads the rest. The **Fingerprint** dropdown in the search panel then becomes a live switcher — picking a different FP swaps the active similarity engine without reloading the database. Substructure search and clustering are FP-independent and work the same across the set.
+The file browser shows the `.fpset` directory as a single 📦 entry. Loading it opens every FP engine in memory and the **Fingerprint** dropdown in the search panel becomes a live switcher — picking a different FP swaps the active similarity engine without reloading the database. Substructure search and clustering are FP-independent and work the same across the set.
 
 A common useful triad is **Morgan/ECFP4 + Morgan/FCFP4 + MACCS Keys**: identity, feature/pharmacophore, and interpretable keys respectively — see the *Fingerprint Types* table below.
 
