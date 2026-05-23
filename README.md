@@ -15,7 +15,7 @@ MolDigger is a molecular structure search and clustering tool available as both 
 - **Named lists with boolean combinators** — save hits as a list (all, selected rows, or imported SMILES), then combine lists with AND / OR / NOT / XOR
 - **GPU acceleration** — NVIDIA CUDA via FPSim2's CudaEngine (Tanimoto only)
 - **Multiple fingerprint types** — Morgan/ECFP4, ECFP6, RDKit Topological, MACCS Keys, Atom Pairs, Topological Torsion
-- **Multi-FP databases** — build a single source with several FP types in one job; sibling `.h5` files are written and a live FP-switcher appears in the search panel
+- **Multi-FP databases** — build a single source with several FP types in one job; the siblings are bundled into a `.fpset` directory that loads as a single logical database, with a live FP-switcher in the search panel
 - **Auto-detects fingerprint type** from the loaded database file
 - **Structure editor** — [Ketcher](https://github.com/epam/ketcher) launched in browser; drawn structures sent back to the app automatically
 - **Results table** — sortable, with 2D thumbnails, MW, ClogP; right-click to copy SMILES or use hit as new query
@@ -115,7 +115,7 @@ chembl.fpset/                      ← the alias entry point
   manifest.json
   chembl.morgan_ecfp4.h5           + companion .smiles.json
   chembl.maccs.h5                  + companion .smiles.json
-  chembl.morgan_fcfp4.h5           + companion .smiles.json
+  chembl.rdkit_topological.h5      + companion .smiles.json
 ```
 
 The file browser shows the `.fpset` directory as a single 📦 entry. Loading it opens every FP engine in memory and the **Fingerprint** dropdown in the search panel becomes a live switcher — picking a different FP swaps the active similarity engine without reloading the database. Substructure search and clustering are FP-independent and work the same across the set.
@@ -232,7 +232,7 @@ The fingerprint type is automatically detected from the loaded `.h5` file.
 - FPSim2 screens **millions of molecules in < 1 second** on CPU (multi-threaded)
 - GPU mode (CUDA) provides an additional **5–50× speedup** for large databases
 - Substructure search caches parsed RDKit Mols and `PatternFingerprint`s at DB-load time, then uses fingerprint superset pre-screening before running `GetSubstructMatch`. On a 137k-molecule database this drops a typical query from ~20 s to **well under 1 s**.
-- The substructure cache is persisted to disk next to the `.h5` file as `<db>.subcache.pkl` (≈ 1 KB / molecule). Subsequent loads of the same database deserialize from disk in seconds instead of rebuilding.
+- The substructure cache is persisted to disk next to the `.h5` file as `<db>.subcache.bin` (≈ 1 KB / molecule). Subsequent loads of the same database deserialize from disk in seconds instead of rebuilding.
 - The `.h5` database itself is memory-mapped — loading is near-instantaneous
 - The results label reports both the **search time** (FPSim2/RDKit computation) and **total time** (including 2D rendering)
 
