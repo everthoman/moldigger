@@ -88,6 +88,18 @@ FP_TYPES = {
     "Topological Torsion  (2048 bits)":            ("TopologicalTorsion", {"fpSize": 2048}),
 }
 
+# Filesystem-safe short tags per FP label, used when building multi-FP sibling
+# files like <base>.<tag>.h5. Must be unique and stable across versions.
+_FP_TAGS = {
+    "Morgan / ECFP4  (radius=2, 2048 bits)":       "morgan_ecfp4",
+    "Morgan / ECFP6  (radius=3, 2048 bits)":       "morgan_ecfp6",
+    "Morgan / FCFP4  (feature, radius=2)":         "morgan_fcfp4",
+    "RDKit Topological  (minPath=1, maxPath=7)":   "rdkit_topological",
+    "MACCS Keys  (166 bits)":                      "maccs",
+    "Atom Pairs  (2048 bits)":                     "atom_pairs",
+    "Topological Torsion  (2048 bits)":            "topological_torsion",
+}
+
 def _compute_fp(mol, fp_type: str, fp_params: dict):
     """Compute a bit-vector fingerprint matching the FPSim2 fp_type/fp_params convention."""
     p = fp_params or {}
@@ -123,6 +135,11 @@ _state = {
     "db_path": None,
     "fp_name": None,
     "mol_count": 0,
+    # Multi-FP set: when a DB is built with sibling FP files, these map
+    # FP display-name -> open FPSim2 engine and FP display-name -> .h5 path.
+    # For a single-FP DB both contain exactly one entry.
+    "fp_engines": {},
+    "fp_files": {},
     # Substructure search uses RDKit's rdSubstructLibrary (C++, multi-threaded):
     #   sub_library     -> rdSubstructLibrary.SubstructLibrary
     #   sub_ids[i]      -> mol_id key into mol_map, for library index i
@@ -787,7 +804,13 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
 
 
 def _run_build_db(jid: str, input_path: str, output_path: str,
-                  mol_format: str, fp_type: str, fp_params: dict, name_prop: str):
+                  mol_format: str, fp_specs: list, name_prop: str):
+    """Build one or more FPSim2 .h5 fingerprint databases from a source file.
+
+    fp_specs: list of (fp_label, fp_type, fp_params). When the list contains
+    more than one entry, sibling files are written as <base>.<tag>.h5 (one per
+    FP), and each companion .smiles.json carries a "__meta__" → "siblings"
+    list so the loader can discover the set."""
     tmp_path = None
     try:
         if not RDKIT_OK:
@@ -795,6 +818,9 @@ def _run_build_db(jid: str, input_path: str, output_path: str,
             return
         if not FPSIM2_OK:
             finish_job(jid, error="FPSim2 is not installed.")
+            return
+        if not fp_specs:
+            finish_job(jid, error="At least one fingerprint type must be selected.")
             return
 
         update_job_progress(jid, "Reading molecules…")
@@ -840,8 +866,6 @@ def _run_build_db(jid: str, input_path: str, output_path: str,
             finish_job(jid, error="No valid molecules found in the source file.")
             return
 
-        update_job_progress(jid, f"Loaded {len(entries):,} molecules. Writing fingerprint database…")
-
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".smi", delete=False, encoding="utf-8"
         ) as tmp:
@@ -849,16 +873,45 @@ def _run_build_db(jid: str, input_path: str, output_path: str,
                 tmp.write(f"{smi}\t{seq_id}\n")
             tmp_path = tmp.name
 
-        create_db_file(tmp_path, output_path, "smi", fp_type, fp_params)
+        multi = len(fp_specs) > 1
+        out_p = Path(output_path)
+        base = out_p.with_suffix("") if out_p.suffix == ".h5" else out_p
 
-        companion = output_path + ".smiles.json"
+        output_files = []  # (fp_label, full_path)
+        for label, _ft, _fp in fp_specs:
+            if multi:
+                tag = _FP_TAGS.get(label, "fp")
+                out_path = f"{base}.{tag}.h5"
+            else:
+                out_path = output_path
+            output_files.append((label, out_path))
+
+        sibling_filenames = [Path(p).name for _, p in output_files] if multi else []
+
         mol_map = {seq_id: {"smiles": smi, "name": name}
                    for seq_id, smi, name in entries}
-        with open(companion, "w", encoding="utf-8") as fh:
-            json.dump(mol_map, fh)
 
+        for idx, ((label, out_path), (_lbl, fp_type, fp_params)) in enumerate(zip(output_files, fp_specs), start=1):
+            update_job_progress(
+                jid,
+                f"Writing fingerprint database {idx}/{len(output_files)}: {label}…"
+            )
+            create_db_file(tmp_path, out_path, "smi", fp_type, fp_params)
+
+            companion = out_path + ".smiles.json"
+            payload: dict = dict(mol_map)
+            if multi:
+                payload["__meta__"] = {"siblings": sibling_filenames}
+            with open(companion, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+
+        primary_path = output_files[0][1]
         update_job_progress(jid, f"Done — {len(entries):,} molecules indexed.")
-        finish_job(jid, result={"path": output_path, "count": len(entries)})
+        finish_job(jid, result={
+            "path": primary_path,
+            "count": len(entries),
+            "files": [p for _, p in output_files],
+        })
 
     except Exception as exc:
         log.exception("DB build failed")
@@ -876,6 +929,9 @@ from pydantic import BaseModel
 
 class LoadDbRequest(BaseModel):
     path: str
+
+class SwitchFpRequest(BaseModel):
+    fp_name: str
 
 class SearchRequest(BaseModel):
     smiles: str
@@ -918,6 +974,7 @@ def api_status():
             "ketcher": (KETCHER_DIR / "index.html").exists(),
             "db_path": _state["db_path"],
             "fp_name": _state["fp_name"],
+            "fp_variants": list((_state.get("fp_engines") or {}).keys()),
             "mol_count": _state["mol_count"],
         }
 
@@ -938,12 +995,42 @@ def _perform_load_db(path: str) -> dict:
     engine = FPSim2Engine(path)
     companion = path + ".smiles.json"
     mol_map = {}
+    sibling_filenames: list = []
     if Path(companion).exists():
         with open(companion, encoding="utf-8") as fh:
             raw = json.load(fh)
+        if isinstance(raw, dict):
+            meta = raw.pop("__meta__", None) or {}
+            siblings_field = meta.get("siblings")
+            if isinstance(siblings_field, list):
+                sibling_filenames = [str(s) for s in siblings_field]
         mol_map = {str(k): v for k, v in raw.items()}
 
     fp_name = _fp_name_from_engine(engine)
+
+    fp_engines = {fp_name: engine}
+    fp_files = {fp_name: path}
+    if sibling_filenames:
+        db_dir = Path(path).parent
+        loaded_name = Path(path).name
+        for sib_name in sibling_filenames:
+            if sib_name == loaded_name:
+                continue
+            sib_path = str(db_dir / sib_name)
+            if not Path(sib_path).exists():
+                log.warning(f"Sibling FP file missing: {sib_path}")
+                continue
+            try:
+                sib_engine = FPSim2Engine(sib_path)
+            except Exception as exc:
+                log.warning(f"Could not open sibling {sib_path}: {exc}")
+                continue
+            sib_fp = _fp_name_from_engine(sib_engine)
+            if sib_fp in fp_engines:
+                log.warning(f"Duplicate FP type '{sib_fp}' in sibling set; ignoring {sib_path}")
+                continue
+            fp_engines[sib_fp] = sib_engine
+            fp_files[sib_fp] = sib_path
 
     sub_cache_source = "disk"
     sub_cache_bytes = 0
@@ -968,6 +1055,8 @@ def _perform_load_db(path: str) -> dict:
         _state["db_path"] = path
         _state["fp_name"] = fp_name
         _state["mol_count"] = len(mol_map)
+        _state["fp_engines"] = fp_engines
+        _state["fp_files"] = fp_files
         _state["sub_library"] = sub_library
         _state["sub_ids"] = sub_ids
 
@@ -977,6 +1066,7 @@ def _perform_load_db(path: str) -> dict:
         "ok": True,
         "mol_count": len(mol_map),
         "fp_name": fp_name,
+        "fp_variants": list(fp_engines.keys()),
         "path": path,
         "sub_cache_count": len(sub_ids),
         "sub_cache_build_s": round(sub_build_s, 2),
@@ -995,6 +1085,27 @@ def api_load_db(req: LoadDbRequest):
     except Exception as exc:
         log.exception("load_db failed")
         return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/switch_fp")
+def api_switch_fp(req: SwitchFpRequest):
+    """Switch the active similarity-search engine to a different FP variant
+    already loaded as a sibling. Substructure cache and mol_map are shared
+    across siblings, so this is a near-instant pointer swap."""
+    with _state_lock:
+        engines = _state.get("fp_engines") or {}
+        files = _state.get("fp_files") or {}
+        if req.fp_name not in engines:
+            return JSONResponse(
+                {"error": f"FP '{req.fp_name}' not available. Loaded: {list(engines.keys())}"},
+                status_code=400,
+            )
+        _state["engine"] = engines[req.fp_name]
+        _state["fp_name"] = req.fp_name
+        _state["db_path"] = files[req.fp_name]
+        new_path = _state["db_path"]
+    _persist_last_db_path(new_path)
+    return {"ok": True, "fp_name": req.fp_name, "path": new_path}
 
 
 @app.on_event("startup")
@@ -1064,7 +1175,9 @@ async def api_build_db(request: Request):
     if "multipart" in content_type or "form" in content_type:
         form = await request.form()
         output_path = (form.get("output_path") or "").strip()
-        fp_label = form.get("fp") or list(FP_TYPES.keys())[0]
+        fp_labels_raw = form.getlist("fp_labels") if hasattr(form, "getlist") else []
+        if not fp_labels_raw and form.get("fp"):
+            fp_labels_raw = [form.get("fp")]
         mol_format = form.get("format") or "sdf"
         name_prop = form.get("name_prop") or ""
         upload: UploadFile | None = form.get("file")
@@ -1082,7 +1195,7 @@ async def api_build_db(request: Request):
         data = await request.json()
         input_path = os.path.expanduser((data.get("input_path") or "").strip())
         output_path = os.path.expanduser((data.get("output_path") or "").strip())
-        fp_label = data.get("fp") or list(FP_TYPES.keys())[0]
+        fp_labels_raw = data.get("fp_labels") or ([data["fp"]] if data.get("fp") else [])
         mol_format = data.get("format") or "sdf"
         name_prop = data.get("name_prop") or ""
 
@@ -1093,12 +1206,19 @@ async def api_build_db(request: Request):
     if not Path(input_path).exists():
         return JSONResponse({"error": f"Input file not found: {input_path}"}, status_code=404)
 
-    fp_type, fp_params = FP_TYPES.get(fp_label, ("Morgan", {"radius": 2, "fpSize": 2048}))
+    fp_labels = [l for l in (fp_labels_raw or []) if l in FP_TYPES]
+    if not fp_labels:
+        fp_labels = [list(FP_TYPES.keys())[0]]
+    # Preserve user order while de-duplicating.
+    seen = set()
+    fp_labels = [l for l in fp_labels if not (l in seen or seen.add(l))]
+
+    fp_specs = [(label, *FP_TYPES[label]) for label in fp_labels]
 
     jid = new_job()
     threading.Thread(
         target=_run_build_db,
-        args=(jid, input_path, output_path, mol_format, fp_type, fp_params, name_prop),
+        args=(jid, input_path, output_path, mol_format, fp_specs, name_prop),
         daemon=True,
     ).start()
     return {"job_id": jid}
@@ -1604,6 +1724,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     user-select: none;
   }
   th.sortable { cursor: pointer; }
+  .fp-checks { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); max-height: 180px; overflow-y: auto; }
+  .fp-checks label { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 400; cursor: pointer; padding: 2px 4px; border-radius: 4px; margin: 0; }
+  .fp-checks label:hover { background: var(--border); }
+  .fp-checks input[type="checkbox"] { margin: 0; }
   th.sortable:hover { color: var(--primary); }
   th .sort-icon { margin-left: 4px; opacity: 0.5; }
   th.sort-asc .sort-icon::after { content: "▲"; }
@@ -1789,8 +1913,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </select>
             </div>
             <div>
-              <label for="build-fp">Fingerprint</label>
-              <select id="build-fp"></select>
+              <label>Fingerprints (tick one or more — each adds a sibling .h5 you can switch between at search time)</label>
+              <div id="build-fp-options" class="fp-checks"></div>
             </div>
             <div>
               <label for="build-nameprop">Name property (SDF only, blank = sequential)</label>
@@ -2119,7 +2243,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <tr><td style="padding:4px 8px;">Atom Pairs</td><td style="padding:4px 8px;">Encodes atom-pair types</td></tr>
   <tr><td style="padding:4px 8px;">Topological Torsion</td><td style="padding:4px 8px;">Encodes torsion angles</td></tr>
 </table>
-<p>The fingerprint type is fixed at database build time and auto-detected on load.</p>
+<p>The fingerprint type is fixed per <code>.h5</code> file at build time. To switch FP at search time, build the database with several types ticked — MolDigger writes one sibling <code>.h5</code> per FP (e.g. <code>chembl.morgan_ecfp4.h5</code>, <code>chembl.maccs.h5</code>) and the <strong>Fingerprint</strong> dropdown in the search panel becomes a live switcher across them.</p>
 
 <hr>
 
@@ -2175,11 +2299,23 @@ const EXAMPLES = [
 document.addEventListener('DOMContentLoaded', function() {
   // Populate FP selects
   const fpSelect = document.getElementById('fp-select');
-  const buildFp = document.getElementById('build-fp');
-  FP_TYPES.forEach(function(name) {
+  const buildFpOptions = document.getElementById('build-fp-options');
+  FP_TYPES.forEach(function(name, i) {
     fpSelect.appendChild(new Option(name, name));
-    buildFp.appendChild(new Option(name, name));
+    const id = 'build-fp-cb-' + i;
+    const wrap = document.createElement('label');
+    wrap.htmlFor = id;
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.id = id;
+    cb.value = name;
+    cb.className = 'build-fp-cb';
+    if (i === 0) cb.checked = true;  // default: Morgan/ECFP4
+    wrap.appendChild(cb);
+    wrap.appendChild(document.createTextNode(' ' + name));
+    buildFpOptions.appendChild(wrap);
   });
+  fpSelect.addEventListener('change', onSearchFpChange);
 
   // Populate examples
   const exSel = document.getElementById('example-select');
@@ -2207,7 +2343,7 @@ function loadStatus() {
       }
       if (d.db_path) {
         document.getElementById('db-path').value = d.db_path;
-        showDbInfo(d.mol_count, d.fp_name);
+        showDbInfo(d.mol_count, d.fp_name, d.fp_variants);
         refreshLists();
       }
     })
@@ -2227,17 +2363,46 @@ function setPill(id, ok, label, warn) {
   }
 }
 
-function showDbInfo(count, fpName) {
+function showDbInfo(count, fpName, fpVariants) {
   const info = document.getElementById('db-info');
   document.getElementById('db-info-count').textContent = count.toLocaleString() + ' molecules';
   document.getElementById('db-info-fp').textContent = fpName || '';
+
+  const sel = document.getElementById('fp-select');
+  const variants = (fpVariants && fpVariants.length) ? fpVariants : (fpName ? [fpName] : FP_TYPES);
+  sel.innerHTML = '';
+  variants.forEach(function(v) { sel.appendChild(new Option(v, v)); });
   if (fpName) {
-    const sel = document.getElementById('fp-select');
     for (let i = 0; i < sel.options.length; i++) {
       if (sel.options[i].value === fpName) { sel.selectedIndex = i; break; }
     }
   }
+  // Only a real switcher when there's more than one variant.
+  sel.disabled = variants.length <= 1;
+  sel.title = variants.length > 1
+    ? 'Switch active fingerprint (sibling .h5 files loaded with this DB)'
+    : 'This database has a single fingerprint type. Build with multiple FPs to switch at runtime.';
   info.classList.add('visible');
+}
+
+function onSearchFpChange(ev) {
+  const fp = ev.target.value;
+  if (!fp) return;
+  fetch('/api/switch_fp', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({fp_name: fp})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.error) {
+        showStatus('db-status', 'error', d.error);
+      } else {
+        document.getElementById('db-info-fp').textContent = d.fp_name;
+        showStatus('db-status', 'success', 'Active fingerprint: ' + d.fp_name);
+      }
+    })
+    .catch(function(e) { showStatus('db-status', 'error', String(e)); });
 }
 
 // ── Card toggle ────────────────────────────────────────────────────────────
@@ -2360,7 +2525,7 @@ function loadDb() {
         showStatus('db-status', 'error', d.error);
       } else {
         showStatus('db-status', 'success', 'Database loaded.');
-        showDbInfo(d.mol_count, d.fp_name);
+        showDbInfo(d.mol_count, d.fp_name, d.fp_variants);
         refreshLists();  // lists are per-DB; refresh after load
       }
     })
@@ -2500,9 +2665,15 @@ function _doPoll(jid, context) {
             (elapsed ? ' — ' + elapsed : ''));
         }
         if (context === 'build') {
+          const files = d.result.files || [d.result.path];
+          const filesMsg = files.length > 1
+            ? ' across ' + files.length + ' FP variants: ' + files.map(function(p) {
+                const parts = p.split('/'); return parts[parts.length - 1];
+              }).join(', ')
+            : ' at ' + d.result.path;
           showStatus('build-status', 'success',
-            'Done — ' + (d.result.count || 0).toLocaleString() + ' molecules indexed at ' + d.result.path);
-          // Offer to load the newly built DB
+            'Done — ' + (d.result.count || 0).toLocaleString() + ' molecules indexed' + filesMsg);
+          // Offer to load the newly built (primary) DB.
           document.getElementById('db-path').value = d.result.path;
         }
       } else if (d.status === 'error') {
@@ -2992,14 +3163,17 @@ function csvEsc(s) {
 function startBuildDb() {
   const inputPath = document.getElementById('build-input').value.trim();
   const outputPath = document.getElementById('build-output').value.trim();
-  const fp = document.getElementById('build-fp').value;
+  const fps = Array.from(document.querySelectorAll('#build-fp-options input.build-fp-cb:checked'))
+    .map(function(c) { return c.value; });
   const fmt = document.getElementById('build-format').value;
   const nameProp = document.getElementById('build-nameprop').value.trim();
 
   if (!inputPath) { showStatus('build-status', 'error', 'Input file path is required.'); return; }
   if (!outputPath) { showStatus('build-status', 'error', 'Output path is required.'); return; }
+  if (fps.length === 0) { showStatus('build-status', 'error', 'Select at least one fingerprint type.'); return; }
 
-  showStatus('build-status', 'info', 'Submitting build job…');
+  const noun = fps.length > 1 ? (fps.length + ' fingerprint variants') : 'fingerprints';
+  showStatus('build-status', 'info', 'Submitting build job (' + noun + ')…');
 
   fetch('/api/build_db', {
     method: 'POST',
@@ -3007,7 +3181,7 @@ function startBuildDb() {
     body: JSON.stringify({
       input_path: inputPath,
       output_path: outputPath,
-      fp: fp,
+      fp_labels: fps,
       format: fmt,
       name_prop: nameProp,
     })

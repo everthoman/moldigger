@@ -15,6 +15,7 @@ MolDigger is a molecular structure search and clustering tool available as both 
 - **Named lists with boolean combinators** — save hits as a list (all, selected rows, or imported SMILES), then combine lists with AND / OR / NOT / XOR
 - **GPU acceleration** — NVIDIA CUDA via FPSim2's CudaEngine (Tanimoto only)
 - **Multiple fingerprint types** — Morgan/ECFP4, ECFP6, FCFP4, RDKit Topological, MACCS Keys, Atom Pairs, Topological Torsion
+- **Multi-FP databases** — build a single source with several FP types in one job; sibling `.h5` files are written and a live FP-switcher appears in the search panel
 - **Auto-detects fingerprint type** from the loaded database file
 - **Structure editor** — [Ketcher](https://github.com/epam/ketcher) launched in browser; drawn structures sent back to the app automatically
 - **Results table** — sortable, with 2D thumbnails, MW, ClogP; right-click to copy SMILES or use hit as new query
@@ -100,10 +101,24 @@ GPU availability is detected automatically at startup. If available, a **Use GPU
 
 1. Go to the **Database** tab
 2. Select an input file (SDF or SMILES)
-3. Choose fingerprint type and output path
+3. Tick one or more fingerprint types and pick an output path
 4. Click **Create Database**
 
 The app writes a `.h5` FPSim2 database and a companion `.h5.smiles.json` file that stores SMILES strings and molecule names for display in the results table.
+
+### Multi-FP databases
+
+A single FPSim2 `.h5` file holds one fingerprint type. If you tick more than one FP at build time, MolDigger writes a *set* of sibling files sharing the same source:
+
+```
+chembl.morgan_ecfp4.h5      + companion .smiles.json
+chembl.maccs.h5             + companion .smiles.json
+chembl.morgan_fcfp4.h5      + companion .smiles.json
+```
+
+Each companion records the siblings, so loading any one of them auto-loads the rest. The **Fingerprint** dropdown in the search panel then becomes a live switcher — picking a different FP swaps the active similarity engine without reloading the database. Substructure search and clustering are FP-independent and work the same across the set.
+
+A common useful triad is **Morgan/ECFP4 + Morgan/FCFP4 + MACCS Keys**: identity, feature/pharmacophore, and interpretable keys respectively — see the *Fingerprint Types* table below.
 
 ---
 
