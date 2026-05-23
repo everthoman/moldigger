@@ -158,7 +158,7 @@ In general: use `[#7]` to match any nitrogen regardless of aromaticity, `[#6]` f
 After a search, a **Cluster** toolbar appears above the results table. Clustering is decoupled from search — you can adjust the cutoff and re-cluster without repeating the database search:
 
 1. Set **Min similarity** (0.10–0.90, default 0.40) — molecules with ≥ this similarity will tend to be grouped together
-2. Click **Apply Clustering** — a **Cluster** column appears and results are sorted by cluster ID
+2. Click **Apply Clustering** — a **Cluster** column appears and results are sorted by cluster ID (click the column header to toggle ascending/descending)
 3. Click **Clear** to remove clustering and restore score order
 
 Clustering always uses **Morgan ECFP4** fingerprints (radius=2, 2048 bits) regardless of the fingerprint type used for the similarity search, as Morgan ECFP4 gives the best chemical groupings for diverse compound sets.
