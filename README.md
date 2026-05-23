@@ -194,7 +194,7 @@ Three ways:
 
 1. **Save all results** — after any search, click **★ Save all as list** in the results header. Prompts for a name; saves every hit currently shown.
 2. **Save selected rows** — tick the checkboxes in the first column of the results table (or the header box for "select all visible"), then click **★ Save selected as list**.
-3. **Import from SMILES** — paste a list of SMILES into the Lists card (one per line) and click **Import**. Each line is canonicalized via RDKit and looked up in the loaded database; unmatched entries are reported in the status message.
+3. **Import list** — open the **Import list…** section in the Lists card, choose **SMILES** or **Identifiers**, paste entries (one per line), give the list a name, and click **Import**. SMILES lines are canonicalized via RDKit, so they work across databases. **Identifiers must match the names stored in the currently loaded database** — these are the values captured from the source file at build time (the SDF `_Name` or the property you chose in **Name property**, or sequential IDs if blank). The same identifier list will fail against a database built from a different source or with a different name property. Unmatched entries are reported in the status message.
 
 ### Combining lists
 

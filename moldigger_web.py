@@ -517,6 +517,33 @@ def _lists_delete_one(name: str) -> tuple[bool, str]:
     return True, f"Deleted list '{name}'."
 
 
+def _lists_resolve_identifiers(names_list: list) -> tuple[list, list]:
+    """Resolve a list of molecule identifiers (name strings) to mol_ids in
+    the loaded DB. Lookup is exact-match on the 'name' field stored in
+    mol_map. Returns (resolved_ids, unresolved_names)."""
+    with _state_lock:
+        mol_map = dict(_state["mol_map"])
+    if not mol_map:
+        return [], list(names_list)
+    idx: dict[str, int] = {}
+    for mid_str, entry in mol_map.items():
+        name = entry.get("name", "") if isinstance(entry, dict) else ""
+        if not name:
+            continue
+        idx.setdefault(str(name), int(mid_str))
+    resolved, missing = [], []
+    for raw in names_list:
+        s = (raw or "").strip()
+        if not s:
+            continue
+        hit = idx.get(s)
+        if hit is None:
+            missing.append(s)
+        else:
+            resolved.append(hit)
+    return resolved, missing
+
+
 def _lists_resolve_smiles(smiles_list: list) -> tuple[list, list]:
     """Resolve a list of SMILES strings to mol_ids in the loaded DB.
 
@@ -1295,6 +1322,7 @@ class ListCreateRequest(BaseModel):
     name: str
     mol_ids: list[int] = []
     smiles: list[str] = []
+    identifiers: list[str] = []
     overwrite: bool = False
 
 
@@ -1324,14 +1352,19 @@ def api_lists_create(req: ListCreateRequest):
     if not _lists_db_key():
         return JSONResponse({"error": "No database loaded."}, status_code=400)
     ids = list(req.mol_ids)
-    unresolved = []
+    unresolved: list = []
     if req.smiles:
-        resolved, unresolved = _lists_resolve_smiles(req.smiles)
+        resolved, missing = _lists_resolve_smiles(req.smiles)
         ids.extend(resolved)
+        unresolved.extend(missing)
+    if req.identifiers:
+        resolved, missing = _lists_resolve_identifiers(req.identifiers)
+        ids.extend(resolved)
+        unresolved.extend(missing)
     if not ids:
         msg = "No molecule IDs to save."
         if unresolved:
-            msg += f" ({len(unresolved)} SMILES could not be resolved.)"
+            msg += f" ({len(unresolved)} input(s) could not be resolved.)"
         return JSONResponse({"error": msg}, status_code=400)
     ok, msg = _lists_write_one(req.name, ids, req.overwrite)
     if not ok:
@@ -2131,14 +2164,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           </div>
         </div>
 
-        <!-- Import from SMILES -->
+        <!-- Import list (SMILES or identifiers) -->
         <details style="margin-top:10px;">
-          <summary style="cursor:pointer; font-size:13px;">Import from SMILES</summary>
+          <summary style="cursor:pointer; font-size:13px;">Import list&hellip;</summary>
           <div style="margin-top:6px;">
+            <div style="display:flex; gap:12px; font-size:12px; margin-bottom:4px;">
+              <label style="display:inline-flex; align-items:center; gap:4px; font-weight:400; cursor:pointer;">
+                <input type="radio" name="lists-import-kind" value="smiles" checked onchange="updateListsImportPlaceholder()"> SMILES
+              </label>
+              <label style="display:inline-flex; align-items:center; gap:4px; font-weight:400; cursor:pointer;">
+                <input type="radio" name="lists-import-kind" value="identifiers" onchange="updateListsImportPlaceholder()"> Identifiers
+              </label>
+            </div>
             <textarea id="lists-import-smiles" rows="3" placeholder="One SMILES per line"></textarea>
             <div class="input-row" style="margin-top:6px;">
               <input type="text" id="lists-import-name" placeholder="List name">
-              <button class="btn btn-primary btn-sm" onclick="importListFromSmiles()">Import</button>
+              <button class="btn btn-primary btn-sm" onclick="importListFromText()">Import</button>
             </div>
             <div id="lists-import-status" class="status-msg"></div>
           </div>
@@ -3130,39 +3171,51 @@ function _postList(name, ids) {
     .catch(function(e) { alert('Save failed: ' + e); });
 }
 
-function importListFromSmiles() {
+function updateListsImportPlaceholder() {
+  const kind = document.querySelector('input[name="lists-import-kind"]:checked').value;
+  const ta = document.getElementById('lists-import-smiles');
+  ta.placeholder = kind === 'identifiers'
+    ? 'One identifier (molecule name) per line'
+    : 'One SMILES per line';
+}
+
+function importListFromText() {
   const name = document.getElementById('lists-import-name').value.trim();
   const raw = document.getElementById('lists-import-smiles').value;
-  const status = document.getElementById('lists-import-status');
+  const kind = document.querySelector('input[name="lists-import-kind"]:checked').value;
   if (!name) { showStatus('lists-import-status', 'error', 'Name is required.'); return; }
-  const smiles = raw.split(/\r?\n/).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
-  if (smiles.length === 0) { showStatus('lists-import-status', 'error', 'No SMILES provided.'); return; }
-  fetch('/api/lists', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({name: name, smiles: smiles, overwrite: false})
-  })
-    .then(function(r) { return r.json(); })
-    .then(function(d) {
-      if (d.error) {
-        if (d.error.indexOf('already exists') >= 0 && confirm(d.error + ' Overwrite?')) {
-          fetch('/api/lists', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({name: name, smiles: smiles, overwrite: true})
-          }).then(function(r) { return r.json(); }).then(function(d2) {
-            if (d2.error) showStatus('lists-import-status', 'error', d2.error);
-            else { showStatus('lists-import-status', 'success', d2.message + (d2.unresolved && d2.unresolved.length ? ' — ' + d2.unresolved.length + ' unresolved.' : '')); refreshLists(); }
-          });
-        } else {
-          showStatus('lists-import-status', 'error', d.error);
-        }
+  const lines = raw.split(/\r?\n/).map(function(s) { return s.trim(); }).filter(function(s) { return s.length > 0; });
+  if (lines.length === 0) {
+    showStatus('lists-import-status', 'error',
+      kind === 'identifiers' ? 'No identifiers provided.' : 'No SMILES provided.');
+    return;
+  }
+  const baseBody = {name: name};
+  if (kind === 'identifiers') baseBody.identifiers = lines;
+  else baseBody.smiles = lines;
+
+  function post(overwrite, cb) {
+    fetch('/api/lists', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(Object.assign({}, baseBody, {overwrite: overwrite}))
+    }).then(function(r) { return r.json(); }).then(cb);
+  }
+  post(false, function(d) {
+    if (d.error) {
+      if (d.error.indexOf('already exists') >= 0 && confirm(d.error + ' Overwrite?')) {
+        post(true, function(d2) {
+          if (d2.error) showStatus('lists-import-status', 'error', d2.error);
+          else { showStatus('lists-import-status', 'success', d2.message + (d2.unresolved && d2.unresolved.length ? ' — ' + d2.unresolved.length + ' unresolved.' : '')); refreshLists(); }
+        });
       } else {
-        showStatus('lists-import-status', 'success', d.message + (d.unresolved && d.unresolved.length ? ' — ' + d.unresolved.length + ' unresolved.' : ''));
-        refreshLists();
+        showStatus('lists-import-status', 'error', d.error);
       }
-    })
-    .catch(function(e) { showStatus('lists-import-status', 'error', String(e)); });
+    } else {
+      showStatus('lists-import-status', 'success', d.message + (d.unresolved && d.unresolved.length ? ' — ' + d.unresolved.length + ' unresolved.' : ''));
+      refreshLists();
+    }
+  });
 }
 
 function deleteList(name) {
