@@ -81,7 +81,7 @@ JOB_TTL = 300  # seconds before completed jobs are GC'd
 FP_TYPES = {
     "Morgan / ECFP4  (radius=2, 2048 bits)":       ("Morgan", {"radius": 2, "fpSize": 2048}),
     "Morgan / ECFP6  (radius=3, 2048 bits)":       ("Morgan", {"radius": 3, "fpSize": 2048}),
-    "Morgan / FCFP4  (feature, radius=2)":         ("Morgan", {"radius": 2, "fpSize": 2048, "includeChirality": False}),
+    "Morgan / FCFP4  (feature, radius=2)":         ("Morgan", {"radius": 2, "fpSize": 2048, "useFeatures": True}),
     "RDKit Topological  (minPath=1, maxPath=7)":   ("RDKit",  {"minPath": 1, "maxPath": 7, "fpSize": 2048}),
     "MACCS Keys  (166 bits)":                      ("MACCSKeys", {}),
     "Atom Pairs  (2048 bits)":                     ("AtomPair", {"fpSize": 2048}),
@@ -348,21 +348,30 @@ def compute_props(smiles: str) -> dict:
 
 
 def _fp_name_from_engine(engine) -> str:
-    """Infer display name from engine fp_type and fp_params."""
+    """Infer display name from engine fp_type and fp_params. Morgan variants
+    (ECFP4, ECFP6, FCFP4) share fp_type='Morgan' but differ in radius and
+    the useFeatures flag, so we disambiguate on both."""
     try:
         fp_type = engine.fp_type
-        fp_params = engine.fp_params
+        fp_params = engine.fp_params or {}
     except AttributeError:
         return "Unknown"
-    for name, (t, p) in FP_TYPES.items():
-        if t != fp_type:
-            continue
-        if fp_type == "Morgan":
-            if p.get("radius") == fp_params.get("radius"):
-                return name
-        else:
+    if fp_type == "Morgan":
+        radius = fp_params.get("radius", 2)
+        use_features = bool(fp_params.get("useFeatures", False))
+        for name, (t, p) in FP_TYPES.items():
+            if t != "Morgan":
+                continue
+            if p.get("radius", 2) != radius:
+                continue
+            if bool(p.get("useFeatures", False)) != use_features:
+                continue
             return name
-    return f"{fp_type}"
+        return "Morgan"
+    for name, (t, _p) in FP_TYPES.items():
+        if t == fp_type:
+            return name
+    return fp_type
 
 # ── Result builder ────────────────────────────────────────────────────────────
 
@@ -1724,6 +1733,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     user-select: none;
   }
   th.sortable { cursor: pointer; }
+  .build-reopen { display: inline-block; font-size: 12px; color: var(--text-muted); text-decoration: none; margin-top: 4px; }
+  .build-reopen:hover { color: var(--primary); text-decoration: underline; }
   .fp-checks { display: flex; flex-direction: column; gap: 4px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); max-height: 180px; overflow-y: auto; }
   .fp-checks label { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 400; cursor: pointer; padding: 2px 4px; border-radius: 4px; margin: 0; }
   .fp-checks label:hover { background: var(--border); }
@@ -1884,8 +1895,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </div>
         <div id="db-status" class="status-msg"></div>
 
+        <a href="#" id="build-reopen" class="build-reopen" onclick="showBuildSection(event)" style="display:none;">+ Build new database</a>
+
         <!-- Build database collapsible -->
-        <div>
+        <div id="build-section">
           <div class="collapsible-header" id="build-toggle" onclick="toggleBuild()">
             <span class="chev">▶</span> Build database&hellip;
           </div>
@@ -2367,6 +2380,12 @@ function showDbInfo(count, fpName, fpVariants) {
   document.getElementById('db-info-count').textContent = count.toLocaleString() + ' molecules';
   document.getElementById('db-info-fp').textContent = fpName || '';
 
+  // Hide the Build section once a DB is loaded; expose a small re-open link.
+  const buildSection = document.getElementById('build-section');
+  const buildReopen = document.getElementById('build-reopen');
+  if (buildSection) buildSection.style.display = 'none';
+  if (buildReopen) buildReopen.style.display = 'inline-block';
+
   const sel = document.getElementById('fp-select');
   const variants = (fpVariants && fpVariants.length) ? fpVariants : (fpName ? [fpName] : FP_TYPES);
   sel.innerHTML = '';
@@ -2417,6 +2436,19 @@ function toggleBuild() {
   const body = document.getElementById('build-body');
   toggle.classList.toggle('open');
   body.classList.toggle('open');
+}
+
+function showBuildSection(ev) {
+  if (ev) ev.preventDefault();
+  const buildSection = document.getElementById('build-section');
+  const buildReopen = document.getElementById('build-reopen');
+  if (buildSection) buildSection.style.display = '';
+  if (buildReopen) buildReopen.style.display = 'none';
+  // Expand the form so the user doesn't have to click again.
+  const toggle = document.getElementById('build-toggle');
+  const body = document.getElementById('build-body');
+  if (toggle && !toggle.classList.contains('open')) toggle.classList.add('open');
+  if (body && !body.classList.contains('open')) body.classList.add('open');
 }
 
 // ── Generic file browser ───────────────────────────────────────────────────
