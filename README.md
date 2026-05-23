@@ -14,7 +14,7 @@ MolDigger is a molecular structure search and clustering tool available as both 
 - **Atom highlighting** — MCS highlighted in similarity hits; matched atoms highlighted in substructure hits (optional, uses RDKit default highlight colour)
 - **Named lists with boolean combinators** — save hits as a list (all, selected rows, or imported SMILES), then combine lists with AND / OR / NOT / XOR
 - **GPU acceleration** — NVIDIA CUDA via FPSim2's CudaEngine (Tanimoto only)
-- **Multiple fingerprint types** — Morgan/ECFP4, ECFP6, FCFP4, RDKit Topological, MACCS Keys, Atom Pairs, Topological Torsion
+- **Multiple fingerprint types** — Morgan/ECFP4, ECFP6, RDKit Topological, MACCS Keys, Atom Pairs, Topological Torsion
 - **Multi-FP databases** — build a single source with several FP types in one job; sibling `.h5` files are written and a live FP-switcher appears in the search panel
 - **Auto-detects fingerprint type** from the loaded database file
 - **Structure editor** — [Ketcher](https://github.com/epam/ketcher) launched in browser; drawn structures sent back to the app automatically
@@ -120,7 +120,7 @@ chembl.fpset/                      ← the alias entry point
 
 The file browser shows the `.fpset` directory as a single 📦 entry. Loading it opens every FP engine in memory and the **Fingerprint** dropdown in the search panel becomes a live switcher — picking a different FP swaps the active similarity engine without reloading the database. Substructure search and clustering are FP-independent and work the same across the set.
 
-A common useful triad is **Morgan/ECFP4 + Morgan/FCFP4 + MACCS Keys**: identity, feature/pharmacophore, and interpretable keys respectively — see the *Fingerprint Types* table below.
+You can tick any combination — there is no hard limit; one build produces one sibling per ticked FP. A reasonable default triad is **Morgan/ECFP4 + RDKit Topological + MACCS Keys**: local-circular substructures, path-based topology, and interpretable structural keys respectively (see the *Fingerprint Types* table below). FPSim2's wrapper around RDKit's Morgan generator does not support feature-based / FCFP-style fingerprints, so feature/pharmacophore-aware Morgan is not available.
 
 ---
 
@@ -218,7 +218,6 @@ Lists are stored in `~/.moldigger/lists.json`, keyed by the resolved absolute pa
 |------|-------------|-------|
 | Morgan / ECFP4 | Morgan, radius=2 | Most common for drug-like molecules |
 | Morgan / ECFP6 | Morgan, radius=3 | Larger neighbourhood |
-| Morgan / FCFP4 | Morgan, radius=2 | Feature-based (pharmacophore-aware) |
 | RDKit Topological | RDKit | Path-based |
 | MACCS Keys | MACCSKeys | 166-bit, interpretable |
 | Atom Pairs | AtomPair | Counts atom-pair types |

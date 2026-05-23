@@ -81,7 +81,6 @@ JOB_TTL = 300  # seconds before completed jobs are GC'd
 FP_TYPES = {
     "Morgan / ECFP4  (radius=2, 2048 bits)":       ("Morgan", {"radius": 2, "fpSize": 2048}),
     "Morgan / ECFP6  (radius=3, 2048 bits)":       ("Morgan", {"radius": 3, "fpSize": 2048}),
-    "Morgan / FCFP4  (feature, radius=2)":         ("Morgan", {"radius": 2, "fpSize": 2048, "useFeatures": True}),
     "RDKit Topological  (minPath=1, maxPath=7)":   ("RDKit",  {"minPath": 1, "maxPath": 7, "fpSize": 2048}),
     "MACCS Keys  (166 bits)":                      ("MACCSKeys", {}),
     "Atom Pairs  (2048 bits)":                     ("AtomPair", {"fpSize": 2048}),
@@ -93,7 +92,6 @@ FP_TYPES = {
 _FP_TAGS = {
     "Morgan / ECFP4  (radius=2, 2048 bits)":       "morgan_ecfp4",
     "Morgan / ECFP6  (radius=3, 2048 bits)":       "morgan_ecfp6",
-    "Morgan / FCFP4  (feature, radius=2)":         "morgan_fcfp4",
     "RDKit Topological  (minPath=1, maxPath=7)":   "rdkit_topological",
     "MACCS Keys  (166 bits)":                      "maccs",
     "Atom Pairs  (2048 bits)":                     "atom_pairs",
@@ -350,8 +348,7 @@ def compute_props(smiles: str) -> dict:
 
 def _fp_name_from_engine(engine) -> str:
     """Infer display name from engine fp_type and fp_params. Morgan variants
-    (ECFP4, ECFP6, FCFP4) share fp_type='Morgan' but differ in radius and
-    the useFeatures flag, so we disambiguate on both."""
+    (ECFP4 vs ECFP6) share fp_type='Morgan' and differ only by radius."""
     try:
         fp_type = engine.fp_type
         fp_params = engine.fp_params or {}
@@ -359,15 +356,9 @@ def _fp_name_from_engine(engine) -> str:
         return "Unknown"
     if fp_type == "Morgan":
         radius = fp_params.get("radius", 2)
-        use_features = bool(fp_params.get("useFeatures", False))
         for name, (t, p) in FP_TYPES.items():
-            if t != "Morgan":
-                continue
-            if p.get("radius", 2) != radius:
-                continue
-            if bool(p.get("useFeatures", False)) != use_features:
-                continue
-            return name
+            if t == "Morgan" and p.get("radius", 2) == radius:
+                return name
         return "Morgan"
     for name, (t, _p) in FP_TYPES.items():
         if t == fp_type:
@@ -2324,7 +2315,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <tr><th style="text-align:left; padding:4px 8px; border-bottom:1px solid #ddd;">Name</th><th style="text-align:left; padding:4px 8px; border-bottom:1px solid #ddd;">Notes</th></tr>
   <tr><td style="padding:4px 8px;">Morgan / ECFP4</td><td style="padding:4px 8px;">Most common for drug-like molecules — recommended</td></tr>
   <tr><td style="padding:4px 8px;">Morgan / ECFP6</td><td style="padding:4px 8px;">Larger neighbourhood</td></tr>
-  <tr><td style="padding:4px 8px;">Morgan / FCFP4</td><td style="padding:4px 8px;">Feature-based, pharmacophore-aware</td></tr>
   <tr><td style="padding:4px 8px;">RDKit Topological</td><td style="padding:4px 8px;">Path-based</td></tr>
   <tr><td style="padding:4px 8px;">MACCS Keys</td><td style="padding:4px 8px;">166-bit, interpretable</td></tr>
   <tr><td style="padding:4px 8px;">Atom Pairs</td><td style="padding:4px 8px;">Encodes atom-pair types</td></tr>
@@ -2366,7 +2356,6 @@ let pollTimer = null;
 const FP_TYPES = [
   "Morgan / ECFP4  (radius=2, 2048 bits)",
   "Morgan / ECFP6  (radius=3, 2048 bits)",
-  "Morgan / FCFP4  (feature, radius=2)",
   "RDKit Topological  (minPath=1, maxPath=7)",
   "MACCS Keys  (166 bits)",
   "Atom Pairs  (2048 bits)",
