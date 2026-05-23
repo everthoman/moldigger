@@ -1751,7 +1751,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     min-width: 56px;
     text-align: center;
   }
-  .score-sub  { background: #dbeafe; color: #1e40af; }
 
   /* ── Structure cell ── */
   .struct-cell { width: 164px; padding: 6px 8px; }
@@ -2705,8 +2704,8 @@ function renderResults(data) {
   const clusterDisplay = hasClusters ? '' : 'none';
   document.querySelectorAll('.cluster-col').forEach(el => el.style.display = clusterDisplay);
 
-  // Hide score column for list results (no meaningful score per row)
-  const scoreColDisplay = (currentSearchType === 'list') ? 'none' : '';
+  // Hide score column when scores aren't meaningful (lists, substructure hits)
+  const scoreColDisplay = (currentSearchType === 'list' || currentSearchType === 'substructure') ? 'none' : '';
   document.querySelectorAll('.score-col').forEach(el => el.style.display = scoreColDisplay);
 
   document.getElementById('placeholder').style.display = 'none';
@@ -2766,15 +2765,7 @@ function _renderTable() {
 
   sorted.forEach(function(row, i) {
     const tr = document.createElement('tr');
-    const isSub = currentSearchType === 'substructure';
-
-    let scoreHtml;
-    if (isSub) {
-      scoreHtml = '<span class="score-cell score-sub">match</span>';
-    } else {
-      scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(2) + '</span>';
-    }
-    const scoreCellDisplay = (currentSearchType === 'list') ? 'none' : '';
+    const scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(2) + '</span>';
 
     const clusterDisplay = (row.cluster_id !== null && row.cluster_id !== undefined) ? '' : 'none';
     const checked = selectedMolIds.has(row.mol_id) ? ' checked' : '';
@@ -2784,7 +2775,7 @@ function _renderTable() {
       '<td class="cluster-col prop-cell" style="display:' + clusterDisplay + ';">' + (row.cluster_id !== null && row.cluster_id !== undefined ? row.cluster_id : '') + '</td>' +
       '<td class="name-cell" title="' + escHtml(row.name || '') + '">' + escHtml(truncate(row.name || '', 24)) + '</td>' +
       '<td class="struct-cell">' + (row.svg || '') + '</td>' +
-      '<td class="score-col" style="display:' + scoreCellDisplay + ';">' + scoreHtml + '</td>' +
+      '<td class="score-col">' + scoreHtml + '</td>' +
       '<td class="prop-cell">' + (row.mw !== null && row.mw !== undefined ? row.mw.toFixed(1) : '—') + '</td>' +
       '<td class="prop-cell">' + (row.clogp !== null && row.clogp !== undefined ? row.clogp.toFixed(2) : '—') + '</td>' +
       '<td>' +
