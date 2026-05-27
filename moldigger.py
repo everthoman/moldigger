@@ -468,12 +468,16 @@ class SubstructureSearchWorker(QThread):
 
         try:
             t0 = time.perf_counter()
-            # Try SMARTS first (richer queries), fall back to SMILES
-            query = Chem.MolFromSmarts(self.query_smarts)
+            # Try SMILES first so aromaticity is perceived; fall back to SMARTS
+            # for richer queries (atom lists, recursive SMARTS, etc.).
+            # SMARTS-first is wrong for Kekulé SMILES queries: MolFromSmarts
+            # takes atoms/bonds literally and won't match aromatic-perceived
+            # database molecules.
+            query = Chem.MolFromSmiles(self.query_smarts)
             if query is None:
-                query = Chem.MolFromSmiles(self.query_smarts)
+                query = Chem.MolFromSmarts(self.query_smarts)
             if query is None:
-                self.error.emit(f"Could not parse query as SMARTS or SMILES:\n{self.query_smarts}")
+                self.error.emit(f"Could not parse query as SMILES or SMARTS:\n{self.query_smarts}")
                 return
 
             # Pre-extract items so workers share the same query mol object
@@ -482,9 +486,9 @@ class SubstructureSearchWorker(QThread):
 
             def match_chunk(chunk):
                 """Parse query once per thread, then match all molecules in chunk."""
-                q = Chem.MolFromSmarts(query_smarts_str)
+                q = Chem.MolFromSmiles(query_smarts_str)
                 if q is None:
-                    q = Chem.MolFromSmiles(query_smarts_str)
+                    q = Chem.MolFromSmarts(query_smarts_str)
                 local_results = []
                 local_atoms   = {}
                 for mol_id, entry in chunk:

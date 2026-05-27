@@ -784,11 +784,16 @@ def _run_substructure_search(jid: str, query: str, n_workers: int, max_results: 
             finish_job(jid, error="Substructure library not built. Reload the database.")
             return
 
-        q = Chem.MolFromSmarts(query)
+        # Try SMILES first so aromaticity is perceived; fall back to SMARTS
+        # for richer queries (atom lists, recursive SMARTS, etc.).
+        # SMARTS-first is wrong for Kekulé SMILES queries: MolFromSmarts
+        # takes atoms/bonds literally and won't match aromatic-perceived
+        # database molecules.
+        q = Chem.MolFromSmiles(query)
         if q is None:
-            q = Chem.MolFromSmiles(query)
+            q = Chem.MolFromSmarts(query)
         if q is None:
-            finish_job(jid, error="Could not parse query as SMARTS or SMILES.")
+            finish_job(jid, error="Could not parse query as SMILES or SMARTS.")
             return
 
         t0 = time.perf_counter()
