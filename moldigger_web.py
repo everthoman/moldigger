@@ -2914,6 +2914,11 @@ function _renderTable() {
   const tbody = document.getElementById('results-tbody');
   tbody.innerHTML = '';
 
+  // Hide score column for searches where the score isn't meaningful
+  // (lists, substructure hits — all 1.00). Applied per-row because rows
+  // are rebuilt fresh on every render/sort.
+  const scoreColStyle = (currentSearchType === 'list' || currentSearchType === 'substructure') ? 'display:none;' : '';
+
   sorted.forEach(function(row, i) {
     const tr = document.createElement('tr');
     const scoreHtml = '<span class="score-cell" style="' + scoreStyle(row.score) + '">' + row.score.toFixed(2) + '</span>';
@@ -2926,7 +2931,7 @@ function _renderTable() {
       '<td class="cluster-col prop-cell" style="display:' + clusterDisplay + ';">' + (row.cluster_id !== null && row.cluster_id !== undefined ? row.cluster_id : '') + '</td>' +
       '<td class="name-cell" title="' + escHtml(row.name || '') + '">' + escHtml(truncate(row.name || '', 24)) + '</td>' +
       '<td class="struct-cell">' + (row.svg || '') + '</td>' +
-      '<td class="score-col">' + scoreHtml + '</td>' +
+      '<td class="score-col" style="' + scoreColStyle + '">' + scoreHtml + '</td>' +
       '<td class="prop-cell">' + (row.mw !== null && row.mw !== undefined ? row.mw.toFixed(1) : '—') + '</td>' +
       '<td class="prop-cell">' + (row.clogp !== null && row.clogp !== undefined ? row.clogp.toFixed(2) : '—') + '</td>' +
       '<td>' +
